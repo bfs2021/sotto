@@ -15,6 +15,7 @@ use crate::error::Error;
 /// Stop replaying an ambiguous Stripe refund create before its idempotency record can expire.
 /// Stripe retains idempotency keys for at least 24 hours; the one-hour margin is deliberate.
 pub const REFUND_CREATE_REPLAY_WINDOW_SECONDS: i64 = 23 * 60 * 60;
+pub const REFUND_CREATE_CLAIM_SECONDS: i64 = 2 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayerKind {
@@ -196,6 +197,15 @@ pub enum RequestDisposition {
     AlreadyExists,
 }
 
+pub enum RefundCreateClaim {
+    Claimed {
+        request: BillingRefundRequest,
+        token: Uuid,
+    },
+    InFlight(BillingRefundRequest),
+    Parked(BillingRefundRequest),
+}
+
 #[derive(Debug, Error)]
 pub enum BillingRefundError {
     #[error("billing correction has invalid {0}")]
@@ -353,6 +363,83 @@ pub async fn begin_provider_refund(
     load_request(tx, request_id).await
 }
 
+/// Atomically claim a refund create or park it after the replay horizon. Only one request may
+/// create at a time, and a live claim prevents another request from parking the row.
+pub async fn claim_or_park_provider_refund_create(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: &str,
+    claim_token: Uuid,
+) -> Result<RefundCreateClaim, BillingRefundError> {
+    let current = load_request_for_update(tx, request_id).await?;
+    if current.state != CorrectionState::ProviderPending || current.provider_refund_id.is_some() {
+        return Err(BillingRefundError::InvalidTransition);
+    }
+    let now_epoch: i64 = sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM now()))::BIGINT")
+        .fetch_one(&mut **tx)
+        .await?;
+    let claim_active: bool = sqlx::query_scalar(
+        "SELECT COALESCE(provider_refund_claimed_until > now(), FALSE) \
+         FROM billing_correction_requests WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if claim_active {
+        return Ok(RefundCreateClaim::InFlight(current));
+    }
+    if !refund_create_replay_allowed(current.provider_refund_started_at_epoch, now_epoch) {
+        sqlx::query(
+            "UPDATE billing_correction_requests SET state = 'unknown', \
+             result_code = 'refund_create_horizon_expired', provider_refund_claim_token = NULL, \
+             provider_refund_claimed_until = NULL, updated_at = now() \
+             WHERE request_id = $1 AND state = 'provider_pending' AND provider_refund_id IS NULL",
+        )
+        .bind(request_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(RefundCreateClaim::Parked(
+            load_request(tx, request_id).await?,
+        ));
+    }
+    sqlx::query(
+        "UPDATE billing_correction_requests SET provider_refund_claim_token = $2::uuid, \
+         provider_refund_claimed_until = now() + ($3 * interval '1 second'), updated_at = now() \
+         WHERE request_id = $1 AND state = 'provider_pending' AND provider_refund_id IS NULL",
+    )
+    .bind(request_id)
+    .bind(claim_token.to_string())
+    .bind(REFUND_CREATE_CLAIM_SECONDS)
+    .execute(&mut **tx)
+    .await?;
+    Ok(RefundCreateClaim::Claimed {
+        request: load_request(tx, request_id).await?,
+        token: claim_token,
+    })
+}
+
+/// Confirm immediately before the provider call that this request still owns a live claim and
+/// remains inside the conservative replay window, using database time for both checks.
+pub async fn provider_refund_create_claim_is_current(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: &str,
+    claim_token: Uuid,
+) -> Result<bool, BillingRefundError> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(state = 'provider_pending' AND provider_refund_id IS NULL \
+         AND provider_refund_claim_token = $2::uuid AND provider_refund_claimed_until > now() \
+         AND provider_refund_started_at_epoch <= FLOOR(EXTRACT(EPOCH FROM now()))::BIGINT \
+         AND provider_refund_started_at_epoch > \
+             FLOOR(EXTRACT(EPOCH FROM now()))::BIGINT - $3, FALSE) \
+         FROM billing_correction_requests WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .bind(claim_token.to_string())
+    .bind(REFUND_CREATE_REPLAY_WINDOW_SECONDS)
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or(false))
+}
+
 pub fn refund_create_replay_allowed(first_attempt_epoch: Option<i64>, now_epoch: i64) -> bool {
     first_attempt_epoch.is_some_and(|first| {
         first <= now_epoch && now_epoch.saturating_sub(first) < REFUND_CREATE_REPLAY_WINDOW_SECONDS
@@ -376,12 +463,23 @@ pub async fn park_ambiguous_refund_create(
     if current.state != CorrectionState::ProviderPending || current.provider_refund_id.is_some() {
         return Err(BillingRefundError::InvalidTransition);
     }
+    let claim_active: bool = sqlx::query_scalar(
+        "SELECT COALESCE(provider_refund_claimed_until > now(), FALSE) \
+         FROM billing_correction_requests WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if claim_active {
+        return Err(BillingRefundError::InvalidTransition);
+    }
     if refund_create_replay_allowed(current.provider_refund_started_at_epoch, now_epoch) {
         return Err(BillingRefundError::InvalidTransition);
     }
     sqlx::query(
         "UPDATE billing_correction_requests SET state = 'unknown', \
-         result_code = 'refund_create_horizon_expired', updated_at = now() \
+         result_code = 'refund_create_horizon_expired', provider_refund_claim_token = NULL, \
+         provider_refund_claimed_until = NULL, updated_at = now() \
          WHERE request_id = $1 AND state = 'provider_pending' AND provider_refund_id IS NULL",
     )
     .bind(request_id)
@@ -419,7 +517,8 @@ pub async fn record_provider_unknown(
     }
     sqlx::query(
         "UPDATE billing_correction_requests SET state = 'unknown', provider_refund_id = $2, \
-         result_code = $3, updated_at = now() WHERE request_id = $1",
+         result_code = $3, provider_refund_claim_token = NULL, provider_refund_claimed_until = NULL, \
+         updated_at = now() WHERE request_id = $1",
     )
     .bind(request_id)
     .bind(provider_refund_id)
@@ -472,7 +571,8 @@ pub async fn record_provider_pending(
     }
     sqlx::query(
         "UPDATE billing_correction_requests SET state = 'provider_pending', \
-         provider_refund_id = $2, result_code = NULL, updated_at = now() WHERE request_id = $1",
+         provider_refund_id = $2, result_code = NULL, provider_refund_claim_token = NULL, \
+         provider_refund_claimed_until = NULL, updated_at = now() WHERE request_id = $1",
     )
     .bind(request_id)
     .bind(provider_refund_id)
@@ -535,7 +635,8 @@ pub async fn record_provider_refund(
     }
     sqlx::query(
         "UPDATE billing_correction_requests SET state = $2, provider_refund_id = $3, \
-         result_code = $4, updated_at = now() WHERE request_id = $1",
+         result_code = $4, provider_refund_claim_token = NULL, provider_refund_claimed_until = NULL, \
+         updated_at = now() WHERE request_id = $1",
     )
     .bind(request_id)
     .bind(target_state.as_str())

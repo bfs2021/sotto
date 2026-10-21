@@ -4,11 +4,12 @@ use sqlx::{postgres::PgConnectOptions, PgPool};
 use uuid::Uuid;
 
 use sotto_server::billing_refunds::{
-    begin_provider_refund, confirm_early_termination, create_request, park_ambiguous_refund_create,
+    begin_provider_refund, claim_or_park_provider_refund_create, confirm_early_termination,
+    create_request, park_ambiguous_refund_create, provider_refund_create_claim_is_current,
     record_provider_pending, record_provider_refund, record_provider_termination,
     record_provider_unknown, refund_create_replay_allowed, review_request, BillingRefundError,
-    CorrectionReason, CorrectionRequest, CorrectionState, PayerKind, RequestDisposition,
-    REFUND_CREATE_REPLAY_WINDOW_SECONDS,
+    CorrectionReason, CorrectionRequest, CorrectionState, PayerKind, RefundCreateClaim,
+    RequestDisposition, REFUND_CREATE_REPLAY_WINDOW_SECONDS,
 };
 use sotto_server::db;
 
@@ -314,5 +315,117 @@ async fn ambiguous_refund_create_parks_before_provider_idempotency_expires() {
         Some(first_attempt)
     );
     tx.commit().await.expect("commit verified refund reference");
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn refund_create_claim_serialises_posts_and_prevents_parking_in_flight() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().to_string();
+    let user = format!("billing-refund-test-{fixture}-user");
+    let operation = format!("billing-refund-test-{fixture}-operation");
+    cleanup(&pool, &fixture).await;
+    seed_personal_account(&pool, &user, &operation).await;
+
+    let mut tx = pool.begin().await.expect("begin correction setup");
+    let (_, request) = create_request(&mut tx, &request(&user, "claim-race", false))
+        .await
+        .expect("create correction");
+    review_request(&mut tx, &request.request_id, true, None)
+        .await
+        .expect("approve correction");
+    let pending = begin_provider_refund(&mut tx, &request.request_id)
+        .await
+        .expect("persist refund attempt");
+    let first_attempt = pending
+        .provider_refund_started_at_epoch
+        .expect("first attempt time is stored");
+    tx.commit().await.expect("commit correction setup");
+
+    let first_token = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin first claim");
+    let first = claim_or_park_provider_refund_create(&mut tx, &request.request_id, first_token)
+        .await
+        .expect("claim the provider create");
+    assert!(matches!(
+        first,
+        RefundCreateClaim::Claimed { token, .. } if token == first_token
+    ));
+    tx.commit().await.expect("commit first claim");
+
+    let second_token = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin competing claim");
+    let second = claim_or_park_provider_refund_create(&mut tx, &request.request_id, second_token)
+        .await
+        .expect("observe the in-flight create");
+    assert!(matches!(second, RefundCreateClaim::InFlight(_)));
+    assert!(
+        provider_refund_create_claim_is_current(&mut tx, &request.request_id, first_token)
+            .await
+            .expect("first token remains the current claim")
+    );
+    tx.commit().await.expect("commit competing observation");
+
+    sqlx::query(
+        "UPDATE billing_correction_requests \
+         SET provider_refund_started_at_epoch = $2 \
+         WHERE request_id = $1",
+    )
+    .bind(&request.request_id)
+    .bind(first_attempt - REFUND_CREATE_REPLAY_WINDOW_SECONDS - 1)
+    .execute(&pool)
+    .await
+    .expect("simulate the replay horizon expiring during a claimed request");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin expired-horizon observation");
+    let still_in_flight =
+        claim_or_park_provider_refund_create(&mut tx, &request.request_id, second_token)
+            .await
+            .expect("a live create claim prevents horizon parking");
+    assert!(matches!(still_in_flight, RefundCreateClaim::InFlight(_)));
+    assert!(
+        !provider_refund_create_claim_is_current(&mut tx, &request.request_id, first_token)
+            .await
+            .expect("an expired original replay window no longer authorises a send")
+    );
+    tx.commit()
+        .await
+        .expect("commit expired-horizon observation");
+
+    sqlx::query(
+        "UPDATE billing_correction_requests \
+         SET provider_refund_claimed_until = now() - interval '1 second' \
+         WHERE request_id = $1",
+    )
+    .bind(&request.request_id)
+    .execute(&pool)
+    .await
+    .expect("expire the create lease");
+    let mut tx = pool.begin().await.expect("begin horizon parking");
+    let parked = claim_or_park_provider_refund_create(&mut tx, &request.request_id, second_token)
+        .await
+        .expect("park after no provider create still owns a live claim");
+    let RefundCreateClaim::Parked(parked) = parked else {
+        panic!("expired ambiguous create should be parked");
+    };
+    assert_eq!(parked.state, CorrectionState::Unknown);
+    assert_eq!(
+        parked.result_code.as_deref(),
+        Some("refund_create_horizon_expired")
+    );
+    tx.commit().await.expect("commit horizon parking");
+
+    let account: (String, i64) = sqlx::query_as(
+        "SELECT state, paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user)
+    .fetch_one(&pool)
+    .await
+    .expect("read account while refund outcome remains unknown");
+    assert_eq!(account, ("active".into(), 1_901_000_000));
     cleanup(&pool, &fixture).await;
 }

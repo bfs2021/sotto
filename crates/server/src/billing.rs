@@ -5161,10 +5161,59 @@ async fn operator_process_refund(
         let next = billing_refunds::begin_provider_refund(&mut tx, &request_id)
             .await
             .map_err(Error::from)?;
-        tx.commit().await?;
         next
     } else {
+        current
+    };
+    let create_claim_token = if current.state == billing_refunds::CorrectionState::ProviderPending
+        && current.provider_refund_id.is_none()
+    {
+        let claim_token = uuid::Uuid::new_v4();
+        match billing_refunds::claim_or_park_provider_refund_create(
+            &mut tx,
+            &request_id,
+            claim_token,
+        )
+        .await
+        .map_err(Error::from)?
+        {
+            billing_refunds::RefundCreateClaim::Claimed { token, .. } => {
+                tx.commit().await?;
+                let mut check_tx = state.pool.begin().await?;
+                let still_current = billing_refunds::provider_refund_create_claim_is_current(
+                    &mut check_tx,
+                    &request_id,
+                    token,
+                )
+                .await
+                .map_err(Error::from)?;
+                let latest = billing_refunds::load_for_operator(&mut check_tx, &request_id)
+                    .await
+                    .map_err(Error::from)?;
+                check_tx.rollback().await?;
+                if !still_current {
+                    return Ok(Json(personal_refund_view(latest)));
+                }
+                Some(token)
+            }
+            billing_refunds::RefundCreateClaim::InFlight(request)
+            | billing_refunds::RefundCreateClaim::Parked(request) => {
+                tx.commit().await?;
+                return Ok(Json(personal_refund_view(request)));
+            }
+        }
+    } else {
         tx.rollback().await?;
+        None
+    };
+    let current = if create_claim_token.is_some() {
+        let mut read_tx = state.pool.begin().await?;
+        let current = billing_refunds::load_for_operator(&mut read_tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        read_tx.rollback().await?;
+        current
+    } else {
         current
     };
     if current.state == billing_refunds::CorrectionState::TerminationPending {
@@ -5185,24 +5234,6 @@ async fn operator_process_refund(
         tx.commit().await?;
         return Ok(Json(personal_refund_view(request)));
     }
-    if current.state == billing_refunds::CorrectionState::ProviderPending
-        && current.provider_refund_id.is_none()
-        && !billing_refunds::refund_create_replay_allowed(
-            current.provider_refund_started_at_epoch,
-            sponsored_billing::current_epoch(),
-        )
-    {
-        let mut tx = state.pool.begin().await?;
-        let request = billing_refunds::park_ambiguous_refund_create(
-            &mut tx,
-            &request_id,
-            sponsored_billing::current_epoch(),
-        )
-        .await
-        .map_err(Error::from)?;
-        tx.commit().await?;
-        return Ok(Json(personal_refund_view(request)));
-    }
     let has_known_refund = current.provider_refund_id.is_some();
     if current.state != billing_refunds::CorrectionState::ProviderPending
         && !(current.state == billing_refunds::CorrectionState::Unknown && has_known_refund)
@@ -5216,7 +5247,7 @@ async fn operator_process_refund(
             .get_refund(provider_refund_id)
             .await
             .map_err(ProviderError::into_error)?
-    } else {
+    } else if create_claim_token.is_some() {
         billing
             .provider
             .create_refund(
@@ -5226,6 +5257,8 @@ async fn operator_process_refund(
             )
             .await
             .map_err(ProviderError::into_error)?
+    } else {
+        return Ok(Json(personal_refund_view(current)));
     };
     if !validate_refund_receipt(&*billing.provider, &current, &receipt).await? {
         let mut tx = state.pool.begin().await?;
