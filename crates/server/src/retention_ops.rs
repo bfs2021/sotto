@@ -20,7 +20,133 @@ const MAX_PAGE_SIZE: i64 = 100;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/ops/cloud/retention", get(list_jobs))
+        .route("/ops/cloud/retention/inventory", get(list_inventory))
         .route("/ops/cloud/retention/{fingerprint}", post(apply_action))
+}
+
+#[derive(Debug, Serialize)]
+struct OrganisationInventoryBucket {
+    lifecycle: &'static str,
+    authority: &'static str,
+    project_band: &'static str,
+    organisations: i64,
+    projects: i64,
+    environments: i64,
+    grants: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareInventoryBucket {
+    share_class: &'static str,
+    lifetime: &'static str,
+    state: &'static str,
+    count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct InventoryResponse {
+    organisations: Vec<OrganisationInventoryBucket>,
+    shares: Vec<ShareInventoryBucket>,
+}
+
+/// Return bounded aggregate facts for the policy-gated shared and link retention review.
+///
+/// This endpoint deliberately exposes no resource identifiers and creates no retention jobs.
+/// The query runs against one read-only snapshot and is capped so a large deployment fails
+/// visibly rather than returning a partial inventory.
+async fn list_inventory(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
+    require_operator(&state, &headers)?;
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '3s'")
+        .execute(&mut *tx)
+        .await?;
+
+    let organisation_rows = sqlx::query(
+        "WITH member_counts AS ( \
+             SELECT org_id, count(*) AS members, \
+                    bool_or(role IN ('owner','admin')) AS has_admin \
+             FROM organization_memberships GROUP BY org_id \
+         ), resource_counts AS ( \
+             SELECT p.org_id, count(DISTINCT p.id) AS projects, \
+                    count(DISTINCT e.id) AS environments, count(g.env_id) AS grants \
+             FROM projects p \
+             LEFT JOIN environments e ON e.project_id=p.id \
+             LEFT JOIN environment_grants g ON g.env_id=e.id \
+             WHERE p.org_id IS NOT NULL GROUP BY p.org_id \
+         ), per_organisation AS ( \
+             SELECT o.lifecycle_state, \
+                    CASE WHEN coalesce(m.has_admin,FALSE) THEN 'owner_or_admin' \
+                         WHEN coalesce(m.members,0)>0 THEN 'members_only' \
+                         ELSE 'no_members' END AS authority, \
+                    CASE WHEN coalesce(r.projects,0)=0 THEN 'none' \
+                         WHEN r.projects=1 THEN 'one' ELSE 'multiple' END AS project_band, \
+                    coalesce(r.projects,0) AS projects, \
+                    coalesce(r.environments,0) AS environments, \
+                    coalesce(r.grants,0) AS grants \
+             FROM organizations o \
+             LEFT JOIN member_counts m ON m.org_id=o.id \
+             LEFT JOIN resource_counts r ON r.org_id=o.id \
+         ) \
+         SELECT lifecycle_state, authority, project_band, count(*) AS organisations, \
+                sum(projects)::bigint AS projects, \
+                sum(environments)::bigint AS environments, \
+                sum(grants)::bigint AS grants \
+         FROM per_organisation \
+         GROUP BY lifecycle_state, authority, project_band \
+         ORDER BY lifecycle_state, authority, project_band",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let organisations = organisation_rows
+        .into_iter()
+        .map(|row| {
+            Ok(OrganisationInventoryBucket {
+                lifecycle: safe_lifecycle(&row.try_get::<String, _>("lifecycle_state")?),
+                authority: safe_authority(&row.try_get::<String, _>("authority")?),
+                project_band: safe_project_band(&row.try_get::<String, _>("project_band")?),
+                organisations: row.try_get("organisations")?,
+                projects: row.try_get("projects")?,
+                environments: row.try_get("environments")?,
+                grants: row.try_get("grants")?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+
+    let share_rows = sqlx::query(
+        "SELECT share_class, \
+                CASE WHEN expires_at IS NULL THEN 'no_expiry' ELSE 'finite' END AS lifetime, \
+                CASE WHEN revoked_at IS NOT NULL THEN 'revoked' \
+                     WHEN view_count >= max_views THEN 'consumed' \
+                     WHEN expires_at IS NOT NULL AND expires_at <= now() THEN 'expired' \
+                     ELSE 'active' END AS state, \
+                count(*) AS count \
+         FROM share_links \
+         GROUP BY share_class, lifetime, state \
+         ORDER BY share_class, lifetime, state",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let shares = share_rows
+        .into_iter()
+        .map(|row| {
+            Ok(ShareInventoryBucket {
+                share_class: safe_share_class(&row.try_get::<String, _>("share_class")?),
+                lifetime: safe_lifetime(&row.try_get::<String, _>("lifetime")?),
+                state: safe_share_state(&row.try_get::<String, _>("state")?),
+                count: row.try_get("count")?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+
+    tx.commit().await?;
+    no_store(Json(InventoryResponse {
+        organisations,
+        shares,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +418,60 @@ fn safe_reason(value: &str) -> &'static str {
         "scope_owner_missing" => "scope_owner_missing",
         "episode_superseded" => "episode_superseded",
         _ => "other",
+    }
+}
+
+fn safe_lifecycle(value: &str) -> &'static str {
+    match value {
+        "active" => "active",
+        "deleting" => "deleting",
+        "deleted" => "deleted",
+        _ => "unknown",
+    }
+}
+
+fn safe_authority(value: &str) -> &'static str {
+    match value {
+        "owner_or_admin" => "owner_or_admin",
+        "members_only" => "members_only",
+        "no_members" => "no_members",
+        _ => "unknown",
+    }
+}
+
+fn safe_project_band(value: &str) -> &'static str {
+    match value {
+        "none" => "none",
+        "one" => "one",
+        "multiple" => "multiple",
+        _ => "unknown",
+    }
+}
+
+fn safe_share_class(value: &str) -> &'static str {
+    match value {
+        "free" => "free",
+        "paid" => "paid",
+        "legacy" => "legacy",
+        _ => "unknown",
+    }
+}
+
+fn safe_lifetime(value: &str) -> &'static str {
+    match value {
+        "finite" => "finite",
+        "no_expiry" => "no_expiry",
+        _ => "unknown",
+    }
+}
+
+fn safe_share_state(value: &str) -> &'static str {
+    match value {
+        "active" => "active",
+        "revoked" => "revoked",
+        "consumed" => "consumed",
+        "expired" => "expired",
+        _ => "unknown",
     }
 }
 

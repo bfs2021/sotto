@@ -322,6 +322,240 @@ async fn cleanup(pool: &PgPool, user_id: &str, organisation_id: &str) {
 }
 
 #[tokio::test]
+async fn protected_retention_inventory_classifies_shared_resources_and_link_promises() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let operator_id = format!("retention-inventory-operator-{suffix}");
+    let member_id = format!("retention-inventory-member-{suffix}");
+    let owned_org_id = format!("retention-inventory-owned-org-{suffix}");
+    let orphan_org_id = format!("retention-inventory-orphan-org-{suffix}");
+    let project_id = format!("retention-inventory-project-{suffix}");
+    let environment_id = format!("retention-inventory-environment-{suffix}");
+    let active_free_id = format!("retention-inventory-share-free-{suffix}");
+    let active_paid_id = format!("retention-inventory-share-paid-{suffix}");
+    let active_legacy_id = format!("retention-inventory-share-legacy-{suffix}");
+    let consumed_id = format!("retention-inventory-share-consumed-{suffix}");
+    let revoked_id = format!("retention-inventory-share-revoked-{suffix}");
+    let expired_id = format!("retention-inventory-share-expired-{suffix}");
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch from now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    cleanup(&pool, &operator_id, &owned_org_id).await;
+    cleanup(&pool, &member_id, &orphan_org_id).await;
+    seed_user(&pool, &operator_id).await;
+    seed_user(&pool, &member_id).await;
+
+    sqlx::query(
+        "INSERT INTO organizations(id,enc_name,created_by) VALUES($1,decode('01','hex'),$2)",
+    )
+    .bind(&owned_org_id)
+    .bind(&operator_id)
+    .execute(&pool)
+    .await
+    .expect("seed owned organisation");
+    sqlx::query("INSERT INTO organizations(id,enc_name) VALUES($1,decode('02','hex'))")
+        .bind(&orphan_org_id)
+        .execute(&pool)
+        .await
+        .expect("seed organisation without members");
+    sqlx::query(
+        "INSERT INTO organization_memberships(org_id,user_id,role) VALUES($1,$2,'owner'),($1,$3,'member')",
+    )
+    .bind(&owned_org_id)
+    .bind(&operator_id)
+    .bind(&member_id)
+    .execute(&pool)
+    .await
+    .expect("seed organisation roles");
+    sqlx::query(
+        "INSERT INTO projects(id,owner_id,org_id,enc_name) VALUES($1,$2,$3,decode('03','hex'))",
+    )
+    .bind(&project_id)
+    .bind(&operator_id)
+    .bind(&owned_org_id)
+    .execute(&pool)
+    .await
+    .expect("seed shared project");
+    sqlx::query(
+        "INSERT INTO environments(id,project_id,enc_name,revision) VALUES($1,$2,decode('04','hex'),4)",
+    )
+    .bind(&environment_id)
+    .bind(&project_id)
+    .execute(&pool)
+    .await
+    .expect("seed shared environment");
+    sqlx::query(
+        "INSERT INTO environment_grants(env_id,user_id,enc_vault_key) VALUES($1,$2,decode('05','hex'))",
+    )
+    .bind(&environment_id)
+    .bind(&member_id)
+    .execute(&pool)
+    .await
+    .expect("seed shared environment grant");
+    sqlx::query(
+        "INSERT INTO share_links(id,token,enc_blob,created_by,max_views,view_count,expires_at,revoked_at,share_class) \
+         VALUES($1,$2,decode('01','hex'),$3,1,0,to_timestamp($4),NULL,'free'), \
+               ($5,$6,decode('02','hex'),$3,1,0,NULL,NULL,'paid'), \
+               ($7,$8,decode('03','hex'),$3,1,0,NULL,NULL,'legacy'), \
+               ($9,$10,decode('04','hex'),$3,1,1,to_timestamp($4),NULL,'free'), \
+               ($11,$12,decode('05','hex'),$3,1,0,to_timestamp($4),to_timestamp($13),'paid'), \
+               ($14,$15,decode('06','hex'),$3,1,0,to_timestamp($16),NULL,'legacy')",
+    )
+    .bind(&active_free_id)
+    .bind(format!("retention-inventory-token-free-{suffix}"))
+    .bind(&operator_id)
+    .bind(now + 86_400)
+    .bind(&active_paid_id)
+    .bind(format!("retention-inventory-token-paid-{suffix}"))
+    .bind(&active_legacy_id)
+    .bind(format!("retention-inventory-token-legacy-{suffix}"))
+    .bind(&consumed_id)
+    .bind(format!("retention-inventory-token-consumed-{suffix}"))
+    .bind(&revoked_id)
+    .bind(format!("retention-inventory-token-revoked-{suffix}"))
+    .bind(now - 100)
+    .bind(&expired_id)
+    .bind(format!("retention-inventory-token-expired-{suffix}"))
+    .bind(now - 200)
+    .execute(&pool)
+    .await
+    .expect("seed share lifetime classes");
+
+    let operator = sotto_server::retention_ops::router().with_state(state(pool.clone()));
+    let unauthorised = operator
+        .clone()
+        .oneshot(
+            Request::get("/ops/cloud/retention/inventory")
+                .body(Body::empty())
+                .expect("build unauthorised inventory request"),
+        )
+        .await
+        .expect("unauthorised inventory response");
+    assert_eq!(unauthorised.status(), StatusCode::UNAUTHORIZED);
+
+    let response = operator
+        .oneshot(
+            Request::get("/ops/cloud/retention/inventory")
+                .header("authorization", "Bearer 0123456789abcdef0123456789abcdef")
+                .body(Body::empty())
+                .expect("build authorised inventory request"),
+        )
+        .await
+        .expect("authorised inventory response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read inventory response");
+    let body_text = String::from_utf8(body.to_vec()).expect("inventory JSON is UTF-8");
+    for private_value in [
+        &operator_id,
+        &member_id,
+        &owned_org_id,
+        &orphan_org_id,
+        &project_id,
+        &environment_id,
+        &active_free_id,
+        &active_paid_id,
+        &active_legacy_id,
+        &consumed_id,
+        &revoked_id,
+        &expired_id,
+        "retention-inventory-token-",
+    ] {
+        assert!(!body_text.contains(private_value), "leaked {private_value}");
+    }
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("parse inventory JSON");
+    let organisations = body["organisations"]
+        .as_array()
+        .expect("organisation buckets");
+    assert!(organisations.iter().any(|bucket| {
+        bucket["lifecycle"] == "active"
+            && bucket["authority"] == "owner_or_admin"
+            && bucket["project_band"] == "one"
+            && bucket["projects"].as_i64().is_some_and(|count| count >= 1)
+            && bucket["environments"]
+                .as_i64()
+                .is_some_and(|count| count >= 1)
+            && bucket["grants"].as_i64().is_some_and(|count| count >= 1)
+    }));
+    assert!(organisations.iter().any(|bucket| {
+        bucket["lifecycle"] == "active"
+            && bucket["authority"] == "no_members"
+            && bucket["project_band"] == "none"
+            && bucket["organisations"]
+                .as_i64()
+                .is_some_and(|count| count >= 1)
+    }));
+    let shares = body["shares"].as_array().expect("share buckets");
+    for (class, lifetime, share_state) in [
+        ("free", "finite", "active"),
+        ("paid", "no_expiry", "active"),
+        ("legacy", "no_expiry", "active"),
+        ("free", "finite", "consumed"),
+        ("paid", "finite", "revoked"),
+        ("legacy", "finite", "expired"),
+    ] {
+        assert!(
+            shares.iter().any(|bucket| {
+                bucket["share_class"] == class
+                    && bucket["lifetime"] == lifetime
+                    && bucket["state"] == share_state
+                    && bucket["count"].as_i64().is_some_and(|count| count >= 1)
+            }),
+            "missing aggregate class {class}/{lifetime}/{share_state}"
+        );
+    }
+    let retention_jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_jobs WHERE scope_key IN ($1,$2)")
+            .bind(&owned_org_id)
+            .bind(&orphan_org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("check that inventory made no jobs");
+    assert_eq!(retention_jobs, 0);
+    let resources_remain: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM organizations WHERE id=$1) \
+         AND EXISTS(SELECT 1 FROM organizations WHERE id=$2) \
+         AND EXISTS(SELECT 1 FROM projects WHERE id=$3) \
+         AND EXISTS(SELECT 1 FROM environments WHERE id=$4) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$5) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$6) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$7) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$8) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$9) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$10)",
+    )
+    .bind(&owned_org_id)
+    .bind(&orphan_org_id)
+    .bind(&project_id)
+    .bind(&environment_id)
+    .bind(&active_free_id)
+    .bind(&active_paid_id)
+    .bind(&active_legacy_id)
+    .bind(&consumed_id)
+    .bind(&revoked_id)
+    .bind(&expired_id)
+    .fetch_one(&pool)
+    .await
+    .expect("check inventory did not delete resources");
+    assert!(resources_remain);
+
+    cleanup(&pool, &operator_id, &owned_org_id).await;
+    cleanup(&pool, &member_id, &orphan_org_id).await;
+}
+
+#[tokio::test]
 async fn expiry_dry_run_snapshots_only_personal_data_and_never_deletes_rows() {
     let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
