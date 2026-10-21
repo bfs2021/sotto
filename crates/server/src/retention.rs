@@ -269,6 +269,30 @@ fn bounded(value: &str, max: usize, field: &'static str) -> RetentionResult<()> 
     Ok(())
 }
 
+pub(crate) fn share_lifetime_hold(
+    share_class: &str,
+    expires_at: Option<i64>,
+    max_views: i32,
+    view_count: i32,
+    revoked: bool,
+    now: i64,
+    creator_deadline: i64,
+) -> Option<&'static str> {
+    if !matches!(share_class, "free" | "paid" | "legacy") {
+        return Some("share_lifetime_unproven");
+    }
+    let inactive =
+        revoked || view_count >= max_views || expires_at.is_some_and(|expiry| expiry <= now);
+    if share_class == "free"
+        && !inactive
+        && expires_at.is_none_or(|expiry| expiry > creator_deadline)
+    {
+        Some("free_share_promise_after_deadline")
+    } else {
+        None
+    }
+}
+
 pub async fn enqueue(pool: &PgPool, intent: &RetentionIntent) -> RetentionResult<EnqueueOutcome> {
     let mut tx = pool.begin().await?;
     let result = enqueue_in_tx(&mut tx, intent).await?;
@@ -2018,7 +2042,9 @@ async fn validate_dry_run_resource(
         }
         "share" => {
             let row = sqlx::query(
-                "SELECT created_by, share_class, extract(epoch from expires_at)::bigint AS expires_epoch, \
+                "SELECT created_by, share_class, max_views, view_count, revoked_at IS NOT NULL AS revoked, \
+                        extract(epoch from expires_at)::bigint AS expires_epoch, \
+                        extract(epoch from now())::bigint AS now_epoch, \
                         (extract(epoch from created_at) * 1000000)::bigint AS created_epoch \
                  FROM share_links WHERE id=$1 FOR UPDATE",
             )
@@ -2030,14 +2056,24 @@ async fn validate_dry_run_resource(
                 Some(row) => {
                     let owner: String = row.try_get("created_by")?;
                     let share_class: String = row.try_get("share_class")?;
+                    let max_views: i32 = row.try_get("max_views")?;
+                    let view_count: i32 = row.try_get("view_count")?;
+                    let revoked: bool = row.try_get("revoked")?;
                     let expires_at: Option<i64> = row.try_get("expires_epoch")?;
+                    let now: i64 = row.try_get("now_epoch")?;
                     let created: i64 = row.try_get("created_epoch")?;
                     if owner != subject {
                         Some("resource_identity_changed")
-                    } else if let Some(hold) =
-                        share_retention_hold(&share_class, expires_at, lease.deadline_epoch)
-                    {
-                        Some(hold)
+                    } else if let Some(reason) = share_lifetime_hold(
+                        &share_class,
+                        expires_at,
+                        max_views,
+                        view_count,
+                        revoked,
+                        now,
+                        lease.deadline_epoch,
+                    ) {
+                        Some(reason)
                     } else if created != expected_created_at {
                         Some("resource_identity_changed")
                     } else {
@@ -2170,5 +2206,43 @@ mod tests {
         assert_eq!(RetentionMode::DryRun.as_str(), "dry_run");
         assert_eq!(RetentionMode::Purge.as_str(), "purge");
         assert_eq!(RetentionState::Held.as_str(), "held");
+    }
+
+    #[test]
+    fn share_lifetimes_keep_free_promises_and_end_paid_legacy_at_creator_deadline() {
+        let deadline = 1_900_000_000;
+        let now = deadline - 86_400;
+        assert_eq!(
+            share_lifetime_hold("free", Some(deadline - 1), 1, 0, false, now, deadline),
+            None
+        );
+        assert_eq!(
+            share_lifetime_hold("free", Some(deadline + 1), 1, 0, false, now, deadline),
+            Some("free_share_promise_after_deadline")
+        );
+        for class in ["paid", "legacy"] {
+            assert_eq!(
+                share_lifetime_hold(class, Some(deadline + 1), 1, 0, false, now, deadline),
+                None
+            );
+            assert_eq!(
+                share_lifetime_hold(class, None, 1, 0, false, now, deadline),
+                None
+            );
+        }
+        for (class, expiry, views, revoked) in [
+            ("free", Some(deadline + 1), 1, false),
+            ("paid", Some(deadline + 1), 0, true),
+            ("free", Some(now - 1), 0, false),
+        ] {
+            assert_eq!(
+                share_lifetime_hold(class, expiry, 1, views, revoked, now, deadline),
+                None
+            );
+        }
+        assert_eq!(
+            share_lifetime_hold("unknown", None, 1, 0, false, now, deadline),
+            Some("share_lifetime_unproven")
+        );
     }
 }

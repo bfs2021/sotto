@@ -43,7 +43,13 @@ pub async fn reconcile_once(state: &AppState) -> Result<usize> {
         refresh_scan(&state.pool, &owner).await?;
         if let Err(error) = reconcile_organisation(state, organisation_id).await {
             eprintln!("Cloud shared retention could not reconcile one organisation: {error}");
-            let _ = hold_existing(&state.pool, organisation_id, "reconciliation_failed").await;
+            if let Err(hold_error) =
+                hold_existing(&state.pool, organisation_id, "reconciliation_failed").await
+            {
+                eprintln!(
+                    "Cloud shared retention could not hold the failed organisation: {hold_error}"
+                );
+            }
         }
     }
     let next = (organisations.len() == ORGANISATION_BATCH as usize)
