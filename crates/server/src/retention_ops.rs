@@ -39,6 +39,7 @@ struct OrganisationInventoryBucket {
 struct ShareInventoryBucket {
     share_class: &'static str,
     lifetime: &'static str,
+    view_limit: &'static str,
     state: &'static str,
     count: i64,
 }
@@ -119,14 +120,15 @@ async fn list_inventory(State(state): State<AppState>, headers: HeaderMap) -> Re
     let share_rows = sqlx::query(
         "SELECT share_class, \
                 CASE WHEN expires_at IS NULL THEN 'no_expiry' ELSE 'finite' END AS lifetime, \
+                CASE WHEN max_views = 1 THEN 'single_use' ELSE 'multi_use' END AS view_limit, \
                 CASE WHEN revoked_at IS NOT NULL THEN 'revoked' \
                      WHEN view_count >= max_views THEN 'consumed' \
                      WHEN expires_at IS NOT NULL AND expires_at <= now() THEN 'expired' \
                      ELSE 'active' END AS state, \
                 count(*) AS count \
          FROM share_links \
-         GROUP BY share_class, lifetime, state \
-         ORDER BY share_class, lifetime, state",
+         GROUP BY share_class, lifetime, view_limit, state \
+         ORDER BY share_class, lifetime, view_limit, state",
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -136,6 +138,7 @@ async fn list_inventory(State(state): State<AppState>, headers: HeaderMap) -> Re
             Ok(ShareInventoryBucket {
                 share_class: safe_share_class(&row.try_get::<String, _>("share_class")?),
                 lifetime: safe_lifetime(&row.try_get::<String, _>("lifetime")?),
+                view_limit: safe_view_limit(&row.try_get::<String, _>("view_limit")?),
                 state: safe_share_state(&row.try_get::<String, _>("state")?),
                 count: row.try_get("count")?,
             })
@@ -411,6 +414,7 @@ fn safe_reason(value: &str) -> &'static str {
         "scope_exceeds_bound" => "scope_exceeds_bound",
         "scope_changed" => "scope_changed",
         "share_lifetime_unproven" => "share_lifetime_unproven",
+        "share_promise_exceeds_deadline" => "share_promise_exceeds_deadline",
         "shared_resource" => "shared_resource",
         "resource_missing" => "resource_missing",
         "resource_identity_changed" => "resource_identity_changed",
@@ -461,6 +465,14 @@ fn safe_lifetime(value: &str) -> &'static str {
     match value {
         "finite" => "finite",
         "no_expiry" => "no_expiry",
+        _ => "unknown",
+    }
+}
+
+fn safe_view_limit(value: &str) -> &'static str {
+    match value {
+        "single_use" => "single_use",
+        "multi_use" => "multi_use",
         _ => "unknown",
     }
 }

@@ -441,8 +441,8 @@ async fn snapshot_personal_scope(
         let share_class: String = row.try_get("share_class")?;
         let expires_epoch: Option<i64> = row.try_get("expires_epoch")?;
         let created: i64 = row.try_get("created_epoch")?;
-        let known_bounded = matches!(share_class.as_str(), "free" | "paid")
-            && expires_epoch.is_some_and(|expiry| expiry <= deadline_epoch);
+        let hold_code =
+            retention::share_retention_hold(&share_class, expires_epoch, deadline_epoch);
         scope.push((
             ScopeItem {
                 job_id: job_id.to_owned(),
@@ -452,7 +452,7 @@ async fn snapshot_personal_scope(
                 expected_created_at_epoch: created,
                 expected_revision: None,
             },
-            (!known_bounded).then_some("share_lifetime_unproven"),
+            hold_code,
         ));
     }
     Ok(scope)

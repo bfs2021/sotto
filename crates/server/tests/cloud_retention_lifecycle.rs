@@ -340,6 +340,7 @@ async fn protected_retention_inventory_classifies_shared_resources_and_link_prom
     let consumed_id = format!("retention-inventory-share-consumed-{suffix}");
     let revoked_id = format!("retention-inventory-share-revoked-{suffix}");
     let expired_id = format!("retention-inventory-share-expired-{suffix}");
+    let multi_use_id = format!("retention-inventory-share-multi-use-{suffix}");
     let now: i64 = sqlx::query_scalar("SELECT extract(epoch from now())::bigint")
         .fetch_one(&pool)
         .await
@@ -403,7 +404,8 @@ async fn protected_retention_inventory_classifies_shared_resources_and_link_prom
                ($7,$8,decode('03','hex'),$3,1,0,NULL,NULL,'legacy'), \
                ($9,$10,decode('04','hex'),$3,1,1,to_timestamp($4),NULL,'free'), \
                ($11,$12,decode('05','hex'),$3,1,0,to_timestamp($4),to_timestamp($13),'paid'), \
-               ($14,$15,decode('06','hex'),$3,1,0,to_timestamp($16),NULL,'legacy')",
+               ($14,$15,decode('06','hex'),$3,1,0,to_timestamp($16),NULL,'legacy'), \
+               ($17,$18,decode('07','hex'),$3,5,0,to_timestamp($19),NULL,'paid')",
     )
     .bind(&active_free_id)
     .bind(format!("retention-inventory-token-free-{suffix}"))
@@ -421,6 +423,9 @@ async fn protected_retention_inventory_classifies_shared_resources_and_link_prom
     .bind(&expired_id)
     .bind(format!("retention-inventory-token-expired-{suffix}"))
     .bind(now - 200)
+    .bind(&multi_use_id)
+    .bind(format!("retention-inventory-token-multi-use-{suffix}"))
+    .bind(now + 86_400)
     .execute(&pool)
     .await
     .expect("seed share lifetime classes");
@@ -471,6 +476,7 @@ async fn protected_retention_inventory_classifies_shared_resources_and_link_prom
         &consumed_id,
         &revoked_id,
         &expired_id,
+        &multi_use_id,
         "retention-inventory-token-",
     ] {
         assert!(!body_text.contains(private_value), "leaked {private_value}");
@@ -498,22 +504,24 @@ async fn protected_retention_inventory_classifies_shared_resources_and_link_prom
                 .is_some_and(|count| count >= 1)
     }));
     let shares = body["shares"].as_array().expect("share buckets");
-    for (class, lifetime, share_state) in [
-        ("free", "finite", "active"),
-        ("paid", "no_expiry", "active"),
-        ("legacy", "no_expiry", "active"),
-        ("free", "finite", "consumed"),
-        ("paid", "finite", "revoked"),
-        ("legacy", "finite", "expired"),
+    for (class, lifetime, view_limit, share_state) in [
+        ("free", "finite", "single_use", "active"),
+        ("paid", "no_expiry", "single_use", "active"),
+        ("legacy", "no_expiry", "single_use", "active"),
+        ("free", "finite", "single_use", "consumed"),
+        ("paid", "finite", "single_use", "revoked"),
+        ("legacy", "finite", "single_use", "expired"),
+        ("paid", "finite", "multi_use", "active"),
     ] {
         assert!(
             shares.iter().any(|bucket| {
                 bucket["share_class"] == class
                     && bucket["lifetime"] == lifetime
+                    && bucket["view_limit"] == view_limit
                     && bucket["state"] == share_state
                     && bucket["count"].as_i64().is_some_and(|count| count >= 1)
             }),
-            "missing aggregate class {class}/{lifetime}/{share_state}"
+            "missing aggregate class {class}/{lifetime}/{view_limit}/{share_state}"
         );
     }
     let retention_jobs: i64 =
@@ -534,7 +542,8 @@ async fn protected_retention_inventory_classifies_shared_resources_and_link_prom
          AND EXISTS(SELECT 1 FROM share_links WHERE id=$7) \
          AND EXISTS(SELECT 1 FROM share_links WHERE id=$8) \
          AND EXISTS(SELECT 1 FROM share_links WHERE id=$9) \
-         AND EXISTS(SELECT 1 FROM share_links WHERE id=$10)",
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$10) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$11)",
     )
     .bind(&owned_org_id)
     .bind(&orphan_org_id)
@@ -546,6 +555,7 @@ async fn protected_retention_inventory_classifies_shared_resources_and_link_prom
     .bind(&consumed_id)
     .bind(&revoked_id)
     .bind(&expired_id)
+    .bind(&multi_use_id)
     .fetch_one(&pool)
     .await
     .expect("check inventory did not delete resources");
@@ -574,6 +584,9 @@ async fn expiry_dry_run_snapshots_only_personal_data_and_never_deletes_rows() {
         format!("retention-lifecycle-shared-personal-env-{suffix}");
     let shared_environment_id = format!("retention-lifecycle-shared-env-{suffix}");
     let safe_share_id = format!("retention-lifecycle-share-safe-{suffix}");
+    let long_free_share_id = format!("retention-lifecycle-share-long-free-{suffix}");
+    let paid_share_id = format!("retention-lifecycle-share-paid-{suffix}");
+    let long_paid_share_id = format!("retention-lifecycle-share-long-paid-{suffix}");
     let legacy_share_id = format!("retention-lifecycle-share-legacy-{suffix}");
     let now: i64 = sqlx::query_scalar("SELECT extract(epoch from now())::bigint")
         .fetch_one(&pool)
@@ -660,17 +673,28 @@ async fn expiry_dry_run_snapshots_only_personal_data_and_never_deletes_rows() {
     sqlx::query(
         "INSERT INTO share_links(id,token,enc_blob,created_by,max_views,expires_at,share_class) \
          VALUES($1,$2,decode('01','hex'),$3,1,to_timestamp($4),'free'), \
-               ($5,$6,decode('02','hex'),$3,1,NULL,'legacy')",
+               ($5,$6,decode('02','hex'),$3,1,to_timestamp($7),'free'), \
+               ($8,$9,decode('03','hex'),$3,5,NULL,'paid'), \
+               ($10,$11,decode('04','hex'),$3,5,to_timestamp($12),'paid'), \
+               ($13,$14,decode('05','hex'),$3,1,NULL,'legacy')",
     )
     .bind(&safe_share_id)
     .bind(format!("token-safe-{suffix}"))
     .bind(&user_id)
     .bind(deadline - 1)
+    .bind(&long_free_share_id)
+    .bind(format!("token-long-free-{suffix}"))
+    .bind(deadline + 7 * 24 * 60 * 60)
+    .bind(&paid_share_id)
+    .bind(format!("token-paid-{suffix}"))
+    .bind(&long_paid_share_id)
+    .bind(format!("token-long-paid-{suffix}"))
+    .bind(deadline + 7 * 24 * 60 * 60)
     .bind(&legacy_share_id)
     .bind(format!("token-legacy-{suffix}"))
     .execute(&pool)
     .await
-    .expect("seed safe and legacy shares");
+    .expect("seed shares for retention cutoff cases");
 
     let state = state(pool.clone());
     sotto_server::cloud_retention_lifecycle::reconcile_user(&state, &user_id)
@@ -760,10 +784,16 @@ async fn expiry_dry_run_snapshots_only_personal_data_and_never_deletes_rows() {
             && row.get::<String, _>("state") == "held"
             && row.get::<Option<String>, _>("hold_code").as_deref() == Some("shared_resource")
     }));
+    for share_id in [&paid_share_id, &long_paid_share_id, &legacy_share_id] {
+        assert!(scope.iter().any(|row| {
+            row.get::<String, _>("resource_id") == *share_id
+                && row.get::<String, _>("state") == "planned"
+        }));
+    }
     assert!(scope.iter().any(|row| {
-        row.get::<String, _>("resource_id") == legacy_share_id
+        row.get::<String, _>("resource_id") == long_free_share_id
             && row.get::<String, _>("state") == "held"
-            && row.get::<String, _>("hold_code") == "share_lifetime_unproven"
+            && row.get::<String, _>("hold_code") == "share_promise_exceeds_deadline"
     }));
 
     let run = sotto_server::retention::run_dry_run_once(&pool, "retention-lifecycle-worker")
@@ -803,12 +833,18 @@ async fn expiry_dry_run_snapshots_only_personal_data_and_never_deletes_rows() {
          AND EXISTS(SELECT 1 FROM environments WHERE id=$2) \
          AND EXISTS(SELECT 1 FROM share_links WHERE id=$3) \
          AND EXISTS(SELECT 1 FROM share_links WHERE id=$4) \
-         AND EXISTS(SELECT 1 FROM projects WHERE id=$5) \
-         AND EXISTS(SELECT 1 FROM environments WHERE id=$6)",
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$5) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$6) \
+         AND EXISTS(SELECT 1 FROM share_links WHERE id=$7) \
+         AND EXISTS(SELECT 1 FROM projects WHERE id=$8) \
+         AND EXISTS(SELECT 1 FROM environments WHERE id=$9)",
     )
     .bind(&project_id)
     .bind(&environment_id)
     .bind(&safe_share_id)
+    .bind(&long_free_share_id)
+    .bind(&paid_share_id)
+    .bind(&long_paid_share_id)
     .bind(&legacy_share_id)
     .bind(&shared_personal_project_id)
     .bind(&shared_personal_environment_id)
