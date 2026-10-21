@@ -4085,23 +4085,6 @@ pub async fn recover_sponsored_billing_operation_by_id(
                 return Ok(());
             }
             with_sponsored_subscription_write_lock(pool, &subscription_id, async {
-                if sponsored_schedule_request_superseded(
-                    pool,
-                    &operation.operation_id,
-                    &subscription_id,
-                )
-                .await?
-                {
-                    sponsored_billing::park_recovery_for_review(
-                        pool,
-                        &operation.operation_id,
-                        &lease_token,
-                        "superseded_by_newer_schedule",
-                    )
-                    .await
-                    .map_err(Error::from)?;
-                    return Ok(());
-                }
                 match billing
                     .provider
                     .verify_sponsored_subscription_update(
@@ -4130,20 +4113,18 @@ pub async fn recover_sponsored_billing_operation_by_id(
                         return Ok(());
                     }
                 }
-                match billing
+                let snapshot = match billing
                     .provider
                     .get_sponsored_subscription(&subscription_id)
                     .await
                 {
-                    Ok(snapshot)
-                        if snapshot.current_period_start == Some(expected_period_start)
-                            && snapshot.current_period_end == Some(expected_period_end) => {}
+                    Ok(snapshot) if snapshot.subscription_id == subscription_id => snapshot,
                     Ok(_) => {
                         sponsored_billing::park_recovery_for_review(
                             pool,
                             &operation.operation_id,
                             &lease_token,
-                            "subscription_period_changed",
+                            "subscription_binding_changed",
                         )
                         .await
                         .map_err(Error::from)?;
@@ -4154,6 +4135,152 @@ pub async fn recover_sponsored_billing_operation_by_id(
                             .await?;
                         return Ok(());
                     }
+                };
+                let Some(current_period_start) = snapshot.current_period_start else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "subscription_period_changed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let Some(current_period_end) = snapshot.current_period_end else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "subscription_period_changed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let Some(catalogue) = billing.price_catalogue() else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "price_catalogue_missing",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let current_phases = match sponsored_provider_phases(
+                    pool,
+                    &organization_id,
+                    catalogue,
+                    sponsored_billing::current_epoch(),
+                )
+                .await
+                {
+                    Ok(phases) if !phases.is_empty() => phases,
+                    Ok(_) | Err(_) => {
+                        sponsored_billing::park_recovery_for_review(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            "local_schedule_evidence_invalid",
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        return Ok(());
+                    }
+                };
+                let Some(current_schedule) =
+                    normalized_sponsored_phases_at(&current_phases, current_period_end)
+                else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "local_schedule_evidence_invalid",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let Some(saved_schedule) =
+                    normalized_sponsored_phases_at(&phases, current_period_end)
+                else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "provider_request_invalid",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                if current_schedule != saved_schedule {
+                    match billing
+                        .provider
+                        .verify_sponsored_subscription_update(
+                            &subscription_id,
+                            current_period_start,
+                            current_period_end,
+                            &current_phases,
+                        )
+                        .await
+                    {
+                        Ok(Some(snapshot)) => {
+                            record_claimed_sponsored_update(
+                                pool,
+                                &operation,
+                                &lease_token,
+                                &snapshot,
+                            )
+                            .await?;
+                        }
+                        Ok(None) if horizon_elapsed => {
+                            sponsored_billing::park_recovery_for_review(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                "superseding_schedule_not_confirmed",
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                        Ok(None) => {
+                            sponsored_billing::defer_recovery(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                sponsored_billing::current_epoch().saturating_add(300),
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                        Err(error) => {
+                            sponsored_billing::record_recovery_failure(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                sponsored_recovery_error_code(&error),
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                if current_period_start != expected_period_start
+                    || current_period_end != expected_period_end
+                {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "subscription_period_changed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
                 }
                 if horizon_elapsed {
                     sponsored_billing::park_recovery_for_review(
@@ -4227,25 +4354,34 @@ where
     }
 }
 
-async fn sponsored_schedule_request_superseded(
-    pool: &sqlx::PgPool,
-    operation_id: &str,
-    subscription_id: &str,
-) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM billing_sponsored_operations current \
-         JOIN billing_sponsored_operations newer \
-           ON newer.provider_subscription_id = current.provider_subscription_id \
-          AND newer.provider_operation_generation > COALESCE(current.provider_operation_generation, 0) \
-         WHERE current.operation_id = $1 AND current.provider_subscription_id = $2 \
-           AND newer.provider_request_version = 1 \
-           AND newer.provider_request ->> 'kind' = 'schedule_update' \
-           AND newer.state <> 'failed')",
-    )
-    .bind(operation_id)
-    .bind(subscription_id)
-    .fetch_one(pool)
-    .await?)
+fn normalized_sponsored_phases_at(
+    phases: &[SponsoredSubscriptionPhase],
+    boundary: i64,
+) -> Option<Vec<SponsoredSubscriptionPhase>> {
+    let phase_at_boundary = phases
+        .iter()
+        .find(|phase| {
+            phase.start_at_epoch <= boundary && phase.end_at_epoch.is_none_or(|end| boundary < end)
+        })
+        .or_else(|| phases.iter().find(|phase| phase.start_at_epoch == boundary))?;
+    let mut normalized = vec![SponsoredSubscriptionPhase {
+        start_at_epoch: boundary,
+        end_at_epoch: phase_at_boundary.end_at_epoch,
+        items: phase_at_boundary.items.clone(),
+    }];
+    normalized.extend(
+        phases
+            .iter()
+            .filter(|phase| phase.start_at_epoch > boundary)
+            .cloned(),
+    );
+    if normalized
+        .last()
+        .is_some_and(|phase| phase.items.is_empty())
+    {
+        normalized.pop();
+    }
+    Some(normalized)
 }
 
 async fn record_claimed_sponsored_update(

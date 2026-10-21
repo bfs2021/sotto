@@ -20,7 +20,7 @@ use sotto_server::billing::{
     BillingState, ProviderError, ProviderErrorKind, ProviderResult, SponsoredCheckoutSession,
     SponsoredSubscriptionItemRequest, SubscriptionObservation, SubscriptionProvider,
 };
-use sotto_server::billing_catalogue::BillingOffer;
+use sotto_server::billing_catalogue::{BillingOffer, BillingPriceIds};
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
     begin_operation, cancel_claimed_expired_checkout, cancel_claimed_rejected_operation,
@@ -47,6 +47,7 @@ struct AppliedScheduleProvider {
     schedule_id: String,
     period_start: i64,
     period_end: i64,
+    applied_quantity: i64,
     verification_calls: AtomicUsize,
     update_calls: AtomicUsize,
 }
@@ -219,18 +220,19 @@ impl SubscriptionProvider for AppliedScheduleProvider {
         phases: &[sotto_server::billing::SponsoredSubscriptionPhase],
     ) -> ProviderResult<Option<sotto_server::billing::SponsoredSubscriptionSnapshot>> {
         self.verification_calls.fetch_add(1, Ordering::SeqCst);
-        let expected_phases = [sotto_server::billing::SponsoredSubscriptionPhase {
-            start_at_epoch: self.period_end,
-            end_at_epoch: None,
-            items: vec![SponsoredSubscriptionItemRequest {
-                provider_price_id: "price_recovery_test".into(),
-                quantity: 1,
-            }],
-        }];
+        let applied_phase = phases.iter().find(|phase| {
+            phase.start_at_epoch == self.period_end
+                && phase.end_at_epoch.is_none()
+                && phase.items
+                    == [SponsoredSubscriptionItemRequest {
+                        provider_price_id: "price_recovery_test".into(),
+                        quantity: self.applied_quantity,
+                    }]
+        });
         if subscription_id != self.subscription_id
             || expected_period_start != self.period_start
             || expected_period_end != self.period_end
-            || phases != expected_phases
+            || applied_phase.is_none()
         {
             return Ok(None);
         }
@@ -1142,6 +1144,7 @@ async fn schedule_recovery_reads_back_the_exact_saved_update_before_replaying() 
         schedule_id: fixture.schedule_id.clone(),
         period_start: fixture.period_start,
         period_end: fixture.period_end,
+        applied_quantity: 1,
         verification_calls: AtomicUsize::new(0),
         update_calls: AtomicUsize::new(0),
     });
@@ -1178,7 +1181,7 @@ async fn schedule_recovery_reads_back_the_exact_saved_update_before_replaying() 
 }
 
 #[tokio::test]
-async fn older_sponsored_schedule_recovery_is_parked_when_a_newer_write_exists() {
+async fn older_sponsored_schedule_recovery_settles_when_newer_schedule_includes_its_seat() {
     let _guard = TEST_LOCK.lock().await;
     let Some(pool) = pool().await else {
         return;
@@ -1217,6 +1220,24 @@ async fn older_sponsored_schedule_recovery_is_parked_when_a_newer_write_exists()
     .await
     .expect("create newer operation for the same sponsored subscription");
     sqlx::query(
+        "UPDATE billing_sponsored_seats SET effective_from = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&fixture.operation_id)
+    .bind(fixture.period_end)
+    .execute(&mut *tx)
+    .await
+    .expect("align the older seat with the shared renewal boundary");
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET effective_from = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&newer_operation.operation_id)
+    .bind(fixture.period_end)
+    .execute(&mut *tx)
+    .await
+    .expect("align the newer seat with the shared renewal boundary");
+    sqlx::query(
         "UPDATE billing_sponsored_operations SET provider_subscription_id = $2 \
          WHERE operation_id = $1",
     )
@@ -1253,6 +1274,7 @@ async fn older_sponsored_schedule_recovery_is_parked_when_a_newer_write_exists()
         schedule_id: fixture.schedule_id.clone(),
         period_start: fixture.period_start,
         period_end: fixture.period_end,
+        applied_quantity: 2,
         verification_calls: AtomicUsize::new(0),
         update_calls: AtomicUsize::new(0),
     });
@@ -1260,23 +1282,52 @@ async fn older_sponsored_schedule_recovery_is_parked_when_a_newer_write_exists()
         provider.clone(),
         "whsec_test".into(),
         "https://app.example.test".into(),
-    );
+    )
+    .with_price_catalogue(BillingPriceIds {
+        standard_monthly: "price_recovery_test".into(),
+        standard_annual: "price_recovery_annual".into(),
+        founding_monthly: "price_recovery_founding_monthly".into(),
+        founding_annual: "price_recovery_founding_annual".into(),
+    });
 
     recover_sponsored_billing_operation_by_id(&pool, &billing, &fixture.operation_id)
         .await
-        .expect("older schedule operation is parked instead of replayed");
-    assert_eq!(provider.verification_calls.load(Ordering::SeqCst), 0);
+        .expect("older operation settles from the current aggregate schedule");
+    assert_eq!(provider.verification_calls.load(Ordering::SeqCst), 2);
     assert_eq!(provider.update_calls.load(Ordering::SeqCst), 0);
-    let (state, error_code): (String, Option<String>) = sqlx::query_as(
-        "SELECT state, recovery_last_error_code FROM billing_sponsored_operations \
-         WHERE operation_id = $1",
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM billing_sponsored_operations WHERE operation_id = $1",
     )
     .bind(&fixture.operation_id)
     .fetch_one(&pool)
     .await
-    .expect("read parked older operation");
-    assert_eq!(state, "manual_review");
-    assert_eq!(error_code.as_deref(), Some("superseded_by_newer_schedule"));
+    .expect("read recovered older operation");
+    assert_eq!(state, "provider_pending");
+
+    let evidence = SponsoredProviderEvidence {
+        customer_id: Some(fixture.customer_id.clone()),
+        subscription_id: fixture.subscription_id.clone(),
+        schedule_id: Some(fixture.schedule_id.clone()),
+        checkout_session_id: None,
+        payment_reference: format!("pi_recovered_{}", Uuid::new_v4()),
+        provider_item_id: Some("si_recovered_seat".into()),
+    };
+    let mut tx = pool.begin().await.expect("begin paid invoice settlement");
+    complete_paid_checkout(&mut tx, &fixture.operation_id, &evidence)
+        .await
+        .expect("paid evidence activates the recovered seat");
+    tx.commit().await.expect("commit recovered seat settlement");
+
+    let (operation_state, seat_state): (String, String) = sqlx::query_as(
+        "SELECT o.state, s.state FROM billing_sponsored_operations o \
+         JOIN billing_sponsored_seats s USING (operation_id) WHERE o.operation_id = $1",
+    )
+    .bind(&fixture.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read final recovered operation and seat state");
+    assert_eq!(operation_state, "active");
+    assert_eq!(seat_state, "active");
 
     clean_recovery_fixture(&pool, &fixture).await;
     sqlx::query("DELETE FROM users WHERE id = $1")
