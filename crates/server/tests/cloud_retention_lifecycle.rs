@@ -101,6 +101,51 @@ async fn seed_expired_projection(pool: &PgPool, user_id: &str, now: i64) -> (i64
     (export_start, deadline)
 }
 
+async fn seed_coverage_until(
+    pool: &PgPool,
+    user_id: &str,
+    paid_until: i64,
+    now: i64,
+    suffix: &str,
+) {
+    seed_authoritative_source(pool, user_id).await;
+    publish_authoritative_coverage(
+        pool,
+        user_id,
+        vec![ConfirmedPaidInterval {
+            coverage_id: format!("coverage:{user_id}"),
+            source_id: format!("source:{user_id}"),
+            starts_at: paid_until - 86_400,
+            paid_until,
+            failed_renewal_id: None,
+        }],
+        now,
+        suffix,
+    )
+    .await;
+}
+
+async fn scan_shared_organisation(state: &AppState, organisation_id: &str) {
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT max(id) FROM organizations WHERE id COLLATE \"C\" < $1 COLLATE \"C\"",
+    )
+    .bind(organisation_id)
+    .fetch_one(&state.pool)
+    .await
+    .expect("find previous organisation for scoped scan");
+    sqlx::query(
+        "UPDATE cloud_retention_scan_state SET cursor_scope_id=$1,lease_owner=NULL,lease_expires_at=NULL \
+         WHERE scan_key='shared_organisation_retention'",
+    )
+    .bind(previous)
+    .execute(&state.pool)
+    .await
+    .expect("position the shared retention scan");
+    sotto_server::cloud_shared_retention::reconcile_once(state)
+        .await
+        .expect("reconcile scoped shared organisation");
+}
+
 async fn seed_authoritative_source(pool: &PgPool, user_id: &str) {
     let source = SourceBinding {
         beneficiary_id: user_id.to_owned(),
@@ -1335,6 +1380,7 @@ async fn bounded_scan_holds_one_conflicted_user_and_continues_to_later_users() {
         notice_event_key: format!("cloud-export-window:{failed_start}:{failed_deadline}"),
         notice_evidence_epoch: Some(failed_start),
         expected_coverage_revision: Some(failed_revision),
+        expected_scope_generation: None,
     };
     assert_eq!(
         retention::enqueue(&pool, &stale_intent)
@@ -1373,4 +1419,253 @@ async fn bounded_scan_holds_one_conflicted_user_and_continues_to_later_users() {
     .execute(&pool)
     .await
     .expect("restore the scan cursor");
+}
+
+#[tokio::test]
+async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_scope() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let owner_id = format!("shared-retention-owner-{suffix}");
+    let admin_id = format!("shared-retention-admin-{suffix}");
+    let eligible_id = format!("shared-retention-eligible-{suffix}");
+    let organisation_id = format!("~shared-retention-org-{suffix}");
+    let eligible_org_id = format!("~shared-retention-active-org-{suffix}");
+    let project_id = format!("shared-retention-project-{suffix}");
+    let environment_id = format!("shared-retention-environment-{suffix}");
+    let token_id = format!("shared-retention-machine-token-{suffix}");
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    for org_id in [&organisation_id, &eligible_org_id] {
+        sqlx::query("DELETE FROM cloud_notice_outbox WHERE scope_id=$1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("remove previous shared notices");
+        sqlx::query("DELETE FROM cloud_retention_jobs WHERE organisation_id=$1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("remove previous shared retention jobs");
+        sqlx::query("DELETE FROM organizations WHERE id=$1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("remove previous test organisation");
+    }
+    for user_id in [&owner_id, &admin_id, &eligible_id] {
+        cleanup(&pool, user_id, &organisation_id).await;
+        seed_user(&pool, user_id).await;
+    }
+    let loss_epoch = now - 60;
+    seed_coverage_until(&pool, &owner_id, loss_epoch, now, "shared-owner-expired").await;
+    seed_coverage_until(&pool, &admin_id, loss_epoch, now, "shared-admin-expired").await;
+    seed_coverage_until(&pool, &eligible_id, now + 86_400, now, "shared-eligible").await;
+
+    sqlx::query("INSERT INTO organizations(id,enc_name) VALUES($1,decode('01','hex')),($2,decode('02','hex'))")
+        .bind(&organisation_id)
+        .bind(&eligible_org_id)
+        .execute(&pool)
+        .await
+        .expect("seed shared organisations");
+    sqlx::query(
+        "INSERT INTO organization_memberships(org_id,user_id,role) \
+         VALUES($1,$2,'owner'),($1,$3,'admin'),($4,$5,'owner'),($4,$3,'admin')",
+    )
+    .bind(&organisation_id)
+    .bind(&owner_id)
+    .bind(&admin_id)
+    .bind(&eligible_org_id)
+    .bind(&eligible_id)
+    .execute(&pool)
+    .await
+    .expect("seed organisation roles");
+    sqlx::query(
+        "INSERT INTO projects(id,owner_id,org_id,enc_name) VALUES($1,$2,$3,decode('03','hex'))",
+    )
+    .bind(&project_id)
+    .bind(&owner_id)
+    .bind(&organisation_id)
+    .execute(&pool)
+    .await
+    .expect("seed shared project");
+    sqlx::query(
+        "INSERT INTO environments(id,project_id,enc_name,revision) VALUES($1,$2,decode('04','hex'),7)",
+    )
+    .bind(&environment_id)
+    .bind(&project_id)
+    .execute(&pool)
+    .await
+    .expect("seed shared environment");
+    sqlx::query(
+        "INSERT INTO environment_grants(env_id,user_id,enc_vault_key) VALUES($1,$2,decode('05','hex'))",
+    )
+    .bind(&environment_id)
+    .bind(&admin_id)
+    .execute(&pool)
+    .await
+    .expect("seed shared grant");
+    sqlx::query(
+        "INSERT INTO machine_tokens \
+         (id,env_id,name,token_hash,public_key,enc_vault_key,created_by,expires_at,beneficiary_id,beneficiary_status) \
+         VALUES($1,$2,'retention-test',$4,decode('07','hex'),decode('08','hex'),$3,now()+interval '7 days',$3,'verified')",
+    )
+    .bind(&token_id)
+    .bind(&environment_id)
+    .bind(&owner_id)
+    .bind(suffix.as_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("seed shared machine token");
+
+    let mut app = state(pool.clone());
+    scan_shared_organisation(&app, &eligible_org_id).await;
+    let premature: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_retention_jobs WHERE organisation_id=$1 AND scope_kind='shared_organisation'",
+    )
+    .bind(&eligible_org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("check active admin prevents a shared candidate");
+    assert_eq!(premature, 0);
+
+    scan_shared_organisation(&app, &organisation_id).await;
+    let held_reason: Option<String> = sqlx::query_scalar(
+        "SELECT hold_code FROM cloud_retention_jobs WHERE organisation_id=$1 AND scope_kind='shared_organisation'",
+    )
+    .bind(&organisation_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read no-contact hold")
+    .flatten();
+    assert_eq!(held_reason.as_deref(), Some("no_verified_owner_contact"));
+    let no_contact_evidence: Option<i64> = sqlx::query_scalar(
+        "SELECT extract(epoch FROM notice_evidence_at)::bigint FROM cloud_retention_jobs WHERE organisation_id=$1 AND scope_kind='shared_organisation'",
+    )
+    .bind(&organisation_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read notice evidence")
+    .flatten();
+    assert_eq!(no_contact_evidence, None);
+    let premature_notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE scope_id=$1 AND kind='shared_export_deadline'",
+    )
+    .bind(&organisation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("check that an uncontactable organisation has no deadline notices");
+    assert_eq!(premature_notices, 0);
+
+    sqlx::query(
+        "INSERT INTO cloud_verified_contacts(contact_id,user_id,channel,destination,verified_at) \
+         VALUES($1,$2,'email',$3,now())",
+    )
+    .bind(format!("shared-retention-contact-{suffix}"))
+    .bind(&owner_id)
+    .bind(format!("owner-{suffix}@example.test"))
+    .execute(&pool)
+    .await
+    .expect("seed one reachable current administrator");
+    scan_shared_organisation(&app, &organisation_id).await;
+    let (job_id, state_name, deadline, evidence): (String, String, i64, Option<i64>) =
+        sqlx::query_as(
+            "SELECT job_id,state,extract(epoch FROM deadline_at)::bigint, \
+                    extract(epoch FROM notice_evidence_at)::bigint \
+             FROM cloud_retention_jobs WHERE organisation_id=$1 AND scope_kind='shared_organisation'",
+        )
+        .bind(&organisation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read qualified shared candidate");
+    assert_eq!(state_name, "ready");
+    assert_eq!(deadline, loss_epoch + EXPORT_WINDOW_SECONDS);
+    assert_eq!(evidence, Some(loss_epoch));
+
+    let notice_count: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT recipient_user_id) FROM cloud_notice_outbox \
+         WHERE scope_id=$1 AND kind='shared_export_deadline' AND channel='in_app' AND status<>'cancelled'",
+    )
+    .bind(&organisation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count notices to all current administrators");
+    assert_eq!(notice_count, 2);
+    let scope: Vec<(String, String)> = sqlx::query_as(
+        "SELECT resource_kind,resource_id FROM cloud_retention_scope_items WHERE job_id=$1 ORDER BY resource_kind",
+    )
+    .bind(&job_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read complete shared scope");
+    assert_eq!(scope.len(), 4);
+    assert!(scope.iter().any(|(kind, _)| kind == "project"));
+    assert!(scope.iter().any(|(kind, _)| kind == "environment"));
+    assert!(scope.iter().any(|(kind, _)| kind == "grant"));
+    assert!(scope.iter().any(|(kind, _)| kind == "machine_token"));
+    let resources_remain: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1) AND \
+                EXISTS(SELECT 1 FROM environments WHERE id=$2) AND \
+                EXISTS(SELECT 1 FROM environment_grants WHERE env_id=$2) AND \
+                EXISTS(SELECT 1 FROM machine_tokens WHERE id=$3)",
+    )
+    .bind(&project_id)
+    .bind(&environment_id)
+    .bind(&token_id)
+    .fetch_one(&pool)
+    .await
+    .expect("confirm dry-run snapshot did not delete resources");
+    assert!(resources_remain);
+
+    sqlx::query(
+        "INSERT INTO environment_grants(env_id,user_id,enc_vault_key) VALUES($1,$2,decode('09','hex'))",
+    )
+    .bind(&environment_id)
+    .bind(&owner_id)
+    .execute(&pool)
+    .await
+    .expect("add a grant after the first scope snapshot");
+    scan_shared_organisation(&app, &organisation_id).await;
+    let (current_generation, refreshed_generation, refreshed_items): (i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT org.retention_generation,job.expected_scope_generation, \
+                    (SELECT count(*) FROM cloud_retention_scope_items item WHERE item.job_id=job.job_id) \
+             FROM organizations org JOIN cloud_retention_jobs job ON job.organisation_id=org.id \
+             WHERE org.id=$1 AND job.scope_kind='shared_organisation' AND job.state='ready'",
+        )
+        .bind(&organisation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read refreshed shared scope");
+    assert_eq!(current_generation, refreshed_generation);
+    assert_eq!(refreshed_items, 5);
+
+    app.cloud_retention_dry_run_enabled = false;
+    sqlx::query("DELETE FROM cloud_notice_outbox WHERE scope_id=$1")
+        .bind(&organisation_id)
+        .execute(&pool)
+        .await
+        .expect("remove shared notices");
+    sqlx::query("DELETE FROM cloud_retention_jobs WHERE organisation_id=$1")
+        .bind(&organisation_id)
+        .execute(&pool)
+        .await
+        .expect("remove shared jobs");
+    sqlx::query("DELETE FROM cloud_retention_jobs WHERE organisation_id=$1")
+        .bind(&eligible_org_id)
+        .execute(&pool)
+        .await
+        .expect("remove active organisation jobs");
+    sqlx::query("DELETE FROM organizations WHERE id=ANY($1)")
+        .bind(vec![organisation_id.clone(), eligible_org_id.clone()])
+        .execute(&pool)
+        .await
+        .expect("remove shared test organisations");
+    for user_id in [&owner_id, &admin_id, &eligible_id] {
+        cleanup(&pool, user_id, &organisation_id).await;
+    }
 }
