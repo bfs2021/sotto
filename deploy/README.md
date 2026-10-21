@@ -167,8 +167,19 @@ The protected `/ops/cloud/retention` inspection and action routes are mounted on
 characters; do not reuse a billing, deployment, or metrics token. The surface returns fixed reason
 codes, counts, deadlines, and opaque job fingerprints. `hold`, `cancel`, and `retry_dry_run` never
 enable purge; an operator-supplied label is audit text, not an authenticated identity. A successful
-dry run is review evidence, not permission to delete data. This slice deliberately has no purge
-route or purge-worker switch.
+dry run is review evidence, not permission to delete data. The purge route and worker have a
+separate default-off gate: `SOTTO_CLOUD_RETENTION_PURGE_ENABLED=1`. They also require a distinct
+destructive operator token, a separate evidence HMAC key, and the exact running build SHA; the
+server refuses incomplete configuration and non-Cloud deployment mode. Keep this switch off
+until the current retention policy, customer notices, exact candidate scope, backup and tombstone
+restore rehearsal have all been independently reviewed. Enabling it does not delete anything by
+itself: a reviewer must register signed restore evidence, inspect the opaque scope fingerprint,
+and approve the exact dry-run candidate. Before each bounded batch the worker rechecks the live
+approval, scope, eligibility, notice and restore-evidence journal count. A successful batch adds
+tombstones, invalidates that approval, and holds the remaining work for a fresh restore rehearsal
+and approval. The destructive operator label is audit text, not an authenticated individual; use
+the credentials only through the protected operator channel and do not place them in logs or
+support messages.
 
 On a 1 GB host, give the kernel some headroom before the first start:
 
