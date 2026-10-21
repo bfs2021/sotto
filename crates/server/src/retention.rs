@@ -408,8 +408,12 @@ pub async fn enqueue_in_tx(
             return Err(RetentionError::IdentityConflict);
         }
         let affected = sqlx::query(
-            "UPDATE cloud_retention_jobs SET expected_scope_generation=$2, state='ready', \
-                    hold_code=NULL, dry_run_completed_at=NULL, lease_owner=NULL, \
+            "UPDATE cloud_retention_jobs SET expected_scope_generation=$2, \
+                    state=CASE WHEN state='held' AND hold_code='operator_hold' \
+                               THEN state ELSE 'ready' END, \
+                    hold_code=CASE WHEN state='held' AND hold_code='operator_hold' \
+                                   THEN hold_code ELSE NULL END, \
+                    dry_run_completed_at=NULL, lease_owner=NULL, \
                     lease_expires_at=NULL, updated_at=now() \
              WHERE job_id=$1 AND dry_run=TRUE AND purge_enabled=FALSE",
         )

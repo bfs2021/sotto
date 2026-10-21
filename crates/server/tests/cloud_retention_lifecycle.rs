@@ -18,7 +18,7 @@ use sotto_server::cloud_coverage_reconciliation::{
 };
 use sotto_server::config::DeploymentMode;
 use sotto_server::db;
-use sotto_server::retention::{self, EnqueueOutcome, RetentionIntent, ScopeKind};
+use sotto_server::retention::{self, EnqueueOutcome, OperatorAction, RetentionIntent, ScopeKind};
 use sotto_server::state::AppState;
 
 fn test_lock() -> &'static Mutex<()> {
@@ -1595,6 +1595,14 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
             .execute(&pool)
             .await
             .expect("remove previous shared notices");
+        sqlx::query(
+            "DELETE FROM cloud_retention_operator_actions WHERE job_id IN \
+             (SELECT job_id FROM cloud_retention_jobs WHERE organisation_id=$1)",
+        )
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("remove previous shared operator actions");
         sqlx::query("DELETE FROM cloud_retention_jobs WHERE organisation_id=$1")
             .bind(org_id)
             .execute(&pool)
@@ -2058,12 +2066,75 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     .expect("confirm shared dry run preserved every resource");
     assert!(resources_remain_after_run);
 
+    retention::apply_operator_action(&pool, &dry_run_job_id, "reviewer", OperatorAction::Hold)
+        .await
+        .expect("hold the shared candidate for operator review");
+    sqlx::query("UPDATE environments SET revision=revision+1 WHERE id=$1")
+        .bind(&environment_id)
+        .execute(&pool)
+        .await
+        .expect("bump scope generation after operator hold");
+    scan_shared_organisation(&app, &organisation_id).await;
+    let (held_state, held_reason, held_generation, held_scope_count):
+        (String, Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT job.state,job.hold_code,job.expected_scope_generation, \
+                    (SELECT count(*) FROM cloud_retention_scope_items item WHERE item.job_id=job.job_id) \
+             FROM cloud_retention_jobs job WHERE job.job_id=$1",
+        )
+        .bind(&dry_run_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read operator-held job after refreshing its scope");
+    assert_eq!(held_state, "held");
+    assert_eq!(held_reason.as_deref(), Some("operator_hold"));
+    let current_generation: i64 =
+        sqlx::query_scalar("SELECT retention_generation FROM organizations WHERE id=$1")
+            .bind(&organisation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read generation after refreshing operator-held scope");
+    assert_eq!(held_generation, current_generation);
+    assert_eq!(held_scope_count, 5);
+
+    retention::apply_operator_action(&pool, &dry_run_job_id, "reviewer", OperatorAction::Cancel)
+        .await
+        .expect("cancel the shared candidate");
+    sqlx::query("UPDATE environments SET revision=revision+1 WHERE id=$1")
+        .bind(&environment_id)
+        .execute(&pool)
+        .await
+        .expect("bump scope generation after operator cancellation");
+    scan_shared_organisation(&app, &organisation_id).await;
+    let (cancelled_state, cancelled_reason, live_job_count):
+        (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT job.state,job.hold_code, \
+                    (SELECT count(*) FROM cloud_retention_jobs live \
+                     WHERE live.organisation_id=job.organisation_id AND live.scope_kind='shared_organisation' \
+                       AND live.state IN ('planned','ready','dry_run','held','leased')) \
+             FROM cloud_retention_jobs job WHERE job.job_id=$1",
+        )
+        .bind(&dry_run_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read cancelled job after scope generation changed");
+    assert_eq!(cancelled_state, "cancelled");
+    assert_eq!(cancelled_reason.as_deref(), Some("operator_cancelled"));
+    assert_eq!(live_job_count, 0);
+
     app.cloud_shared_retention_dry_run_enabled = false;
     sqlx::query("DELETE FROM cloud_notice_outbox WHERE scope_id=$1")
         .bind(&organisation_id)
         .execute(&pool)
         .await
         .expect("remove shared notices");
+    sqlx::query(
+        "DELETE FROM cloud_retention_operator_actions WHERE job_id IN \
+         (SELECT job_id FROM cloud_retention_jobs WHERE organisation_id=$1)",
+    )
+    .bind(&organisation_id)
+    .execute(&pool)
+    .await
+    .expect("remove shared operator actions");
     sqlx::query("DELETE FROM cloud_retention_jobs WHERE organisation_id=$1")
         .bind(&organisation_id)
         .execute(&pool)

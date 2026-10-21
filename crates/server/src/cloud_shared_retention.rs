@@ -358,16 +358,24 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
     .fetch_optional(&mut *tx)
     .await?
     .flatten();
-    let previous_generation: Option<i64> = sqlx::query_scalar(
-        "SELECT expected_scope_generation FROM cloud_retention_jobs \
-         WHERE scope_kind='shared_organisation' AND scope_key=$1 AND eligibility_episode=$2",
+    let previous_job: Option<(Option<i64>, String, Option<String>)> = sqlx::query_as(
+        "SELECT expected_scope_generation,state,hold_code FROM cloud_retention_jobs \
+         WHERE scope_kind='shared_organisation' AND scope_key=$1 AND eligibility_episode=$2 \
+         FOR UPDATE",
     )
     .bind(organisation_id)
     .bind(&episode)
     .fetch_optional(&mut *tx)
-    .await?
-    .flatten();
-    let refresh_scope = previous_generation != Some(generation);
+    .await?;
+    let previous_generation = previous_job
+        .as_ref()
+        .and_then(|(generation, _, _)| *generation);
+    let previous_state = previous_job.as_ref().map(|(_, state, _)| state.as_str());
+    let preserve_operator_hold = previous_job.as_ref().is_some_and(|(_, state, hold_code)| {
+        state == "held" && hold_code.as_deref() == Some("operator_hold")
+    });
+    let terminal_job = matches!(previous_state, Some("cancelled" | "completed" | "failed"));
+    let refresh_scope = previous_generation != Some(generation) && !terminal_job;
     let evidence_epoch =
         stored_evidence.or_else(|| (notices_complete && now <= deadline).then_some(queued_epoch));
     cancel_other_episodes(&mut tx, organisation_id, &episode).await?;
@@ -417,7 +425,9 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
             .await?;
         let scope = snapshot_scope(&mut tx, organisation_id, &job_id).await?;
         if scope.len() > MAX_SCOPE_ITEMS {
-            hold_job(&mut tx, &job_id, "scope_exceeds_bound").await?;
+            if !preserve_operator_hold {
+                hold_job(&mut tx, &job_id, "scope_exceeds_bound").await?;
+            }
         } else {
             for item in scope {
                 retention::add_scope_item_in_tx(&mut tx, &item, "planned", None)
@@ -426,7 +436,18 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
             }
         }
     }
-    if !contact_available {
+    if terminal_job {
+        // Operator cancellation and completed work remain terminal across scope changes.
+    } else if preserve_operator_hold {
+        sqlx::query(
+            "UPDATE cloud_retention_jobs SET state='held',hold_code='operator_hold', \
+                 lease_owner=NULL,lease_expires_at=NULL,updated_at=now() \
+             WHERE job_id=$1 AND dry_run=TRUE AND purge_enabled=FALSE",
+        )
+        .bind(&job_id)
+        .execute(&mut *tx)
+        .await?;
+    } else if !contact_available {
         hold_job(&mut tx, &job_id, "no_verified_owner_contact").await?;
     } else if !notices_complete {
         hold_job(&mut tx, &job_id, "notice_evidence_incomplete").await?;
@@ -711,7 +732,7 @@ async fn cancel_superseded_notices(
 }
 
 async fn hold_existing(pool: &PgPool, org_id: &str, reason: &str) -> Result<()> {
-    sqlx::query("UPDATE cloud_retention_jobs SET state='held',hold_code=$2,lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE organisation_id=$1 AND scope_kind IN ('shared_organisation','orphan_organisation') AND state IN ('planned','ready','dry_run','held','leased') AND dry_run=TRUE AND purge_enabled=FALSE")
+    sqlx::query("UPDATE cloud_retention_jobs SET state='held',hold_code=CASE WHEN state='held' AND hold_code='operator_hold' THEN hold_code ELSE $2 END,lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE organisation_id=$1 AND scope_kind IN ('shared_organisation','orphan_organisation') AND state IN ('planned','ready','dry_run','held','leased') AND dry_run=TRUE AND purge_enabled=FALSE")
         .bind(org_id).bind(reason).execute(pool).await?;
     Ok(())
 }
