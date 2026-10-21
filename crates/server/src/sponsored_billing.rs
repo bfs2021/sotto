@@ -1249,7 +1249,7 @@ pub async fn record_founding_refund_required(
          provider_item_id = COALESCE($6, provider_item_id), result_code = 'founding_refund_required', \
          recovery_lease_token = NULL, recovery_lease_until = NULL, recovery_manual_review_required = FALSE, \
          updated_at = now() \
-         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','failed') \
+         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','failed','manual_review') \
            AND (provider_payment_reference IS NULL OR provider_payment_reference = $2) RETURNING operation_id",
     )
     .bind(operation_id)
@@ -1315,7 +1315,7 @@ pub async fn cancel_failed_operation(
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'failed', result_code = $2, updated_at = now(), \
          recovery_lease_token = NULL, recovery_lease_until = NULL, recovery_manual_review_required = FALSE \
-         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown') RETURNING operation_id",
+         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','manual_review') RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(result_code)

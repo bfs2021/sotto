@@ -24,8 +24,9 @@ use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
     begin_operation, cancel_claimed_expired_checkout, cancel_claimed_rejected_operation,
-    claim_recovery, complete_paid_checkout, next_recovery_candidate, persist_provider_request,
-    record_checkout, record_provider_update, record_recovery_failure, SponsoredBillingError,
+    cancel_failed_operation, claim_recovery, complete_paid_checkout, next_recovery_candidate,
+    persist_provider_request, record_checkout, record_founding_refund_required,
+    record_provider_update, record_recovery_failure, SponsoredBillingError,
     SponsoredProviderEvidence, SponsoredProviderRequest, SponsoredSeatAction, SponsoredSeatRequest,
 };
 
@@ -1283,4 +1284,82 @@ async fn older_sponsored_schedule_recovery_is_parked_when_a_newer_write_exists()
         .execute(&pool)
         .await
         .expect("delete newer operation beneficiary after fixture cleanup");
+}
+
+#[tokio::test]
+async fn signed_expiry_and_refund_close_sponsored_manual_review_operations() {
+    let _guard = TEST_LOCK.lock().await;
+    let Some(pool) = pool().await else {
+        return;
+    };
+
+    let expiry_fixture = create_recovery_fixture(&pool, &Uuid::new_v4().to_string(), false).await;
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET state = 'manual_review', \
+         result_code = 'request_facts_missing', recovery_manual_review_required = TRUE \
+         WHERE operation_id = $1",
+    )
+    .bind(&expiry_fixture.operation_id)
+    .execute(&pool)
+    .await
+    .expect("park checkout for manual review");
+    let mut tx = pool.begin().await.expect("begin signed expiry transaction");
+    let expired =
+        cancel_failed_operation(&mut tx, &expiry_fixture.operation_id, "checkout_expired")
+            .await
+            .expect("signed expiry closes the parked checkout");
+    tx.commit().await.expect("commit signed expiry");
+    assert_eq!(expired.state, "failed");
+    assert!(!expired.recovery_manual_review_required);
+    let expiry_seat_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_sponsored_seats WHERE operation_id = $1")
+            .bind(&expiry_fixture.operation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load expired seat state");
+    assert_eq!(expiry_seat_state, "canceled");
+
+    let refund_fixture = create_recovery_fixture(&pool, &Uuid::new_v4().to_string(), false).await;
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET state = 'manual_review', \
+         result_code = 'request_facts_missing', recovery_manual_review_required = TRUE \
+         WHERE operation_id = $1",
+    )
+    .bind(&refund_fixture.operation_id)
+    .execute(&pool)
+    .await
+    .expect("park founding checkout for manual review");
+    let evidence = SponsoredProviderEvidence {
+        customer_id: Some(refund_fixture.customer_id.clone()),
+        subscription_id: refund_fixture.subscription_id.clone(),
+        schedule_id: None,
+        checkout_session_id: Some(refund_fixture.session_id.clone()),
+        payment_reference: format!("pi_refund_{}", Uuid::new_v4()),
+        provider_item_id: None,
+    };
+    let mut tx = pool.begin().await.expect("begin signed refund transaction");
+    let refund = record_founding_refund_required(&mut tx, &refund_fixture.operation_id, &evidence)
+        .await
+        .expect("signed paid evidence records the refund for a parked checkout");
+    tx.commit().await.expect("commit signed refund result");
+    assert_eq!(refund.state, "failed");
+    assert_eq!(
+        refund.result_code.as_deref(),
+        Some("founding_refund_required")
+    );
+    assert_eq!(
+        refund.provider_payment_reference.as_deref(),
+        Some(evidence.payment_reference.as_str())
+    );
+    assert!(!refund.recovery_manual_review_required);
+    let refund_seat_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_sponsored_seats WHERE operation_id = $1")
+            .bind(&refund_fixture.operation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load refund-required seat state");
+    assert_eq!(refund_seat_state, "canceled");
+
+    clean_recovery_fixture(&pool, &expiry_fixture).await;
+    clean_recovery_fixture(&pool, &refund_fixture).await;
 }
