@@ -5266,7 +5266,7 @@ async fn operator_process_refund(
             &mut tx,
             &request_id,
             &receipt.refund_id,
-            "provider_refund_amount_mismatch",
+            "provider_refund_evidence_mismatch",
         )
         .await
         .map_err(Error::from)?;
