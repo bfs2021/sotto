@@ -263,6 +263,7 @@ async fn reconcile_expiry_candidate(
         notice_event_key,
         notice_evidence_epoch,
         expected_coverage_revision: Some(revision),
+        expected_scope_generation: None,
     };
     if retention::enqueue_in_tx(&mut tx, &intent)
         .await
@@ -552,12 +553,28 @@ pub fn spawn(state: AppState) {
             if reconcile_once(&state).await.is_err() {
                 eprintln!("cloud retention candidate reconciliation failed");
             }
+            if crate::cloud_shared_retention::reconcile_once(&state)
+                .await
+                .is_err()
+            {
+                eprintln!("cloud shared retention candidate reconciliation failed");
+            }
             for _ in 0..128 {
                 match retention::run_dry_run_once(&state.pool, &worker_id).await {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(_) => {
                         eprintln!("cloud retention dry run failed");
+                        break;
+                    }
+                }
+            }
+            for _ in 0..128 {
+                match retention::run_shared_dry_run_once(&state.pool, &worker_id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        eprintln!("cloud shared retention dry run failed");
                         break;
                     }
                 }

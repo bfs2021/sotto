@@ -209,7 +209,7 @@ async fn list_jobs(
     }
     let state_rows = sqlx::query(
         "SELECT state, count(*) AS count FROM cloud_retention_jobs \
-         WHERE scope_kind='personal' GROUP BY state ORDER BY state",
+         WHERE scope_kind IN ('personal','shared_organisation','orphan_organisation') GROUP BY state ORDER BY state",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -226,11 +226,11 @@ async fn list_jobs(
     let hold_rows = sqlx::query(
         "SELECT reason, sum(count) AS count FROM ( \
            SELECT hold_code AS reason, count(*) AS count FROM cloud_retention_jobs \
-             WHERE scope_kind='personal' AND hold_code IS NOT NULL GROUP BY hold_code \
+             WHERE scope_kind IN ('personal','shared_organisation','orphan_organisation') AND hold_code IS NOT NULL GROUP BY hold_code \
            UNION ALL \
            SELECT item.hold_code AS reason, count(*) AS count \
              FROM cloud_retention_scope_items item JOIN cloud_retention_jobs job USING(job_id) \
-             WHERE job.scope_kind='personal' AND item.state='held' AND item.hold_code IS NOT NULL \
+             WHERE job.scope_kind IN ('personal','shared_organisation','orphan_organisation') AND item.state='held' AND item.hold_code IS NOT NULL \
              GROUP BY item.hold_code \
          ) holds GROUP BY reason ORDER BY reason",
     )
@@ -255,7 +255,7 @@ async fn list_jobs(
                 count(*) FILTER (WHERE i.state='dry_run') AS dry_run_items, \
                 count(*) FILTER (WHERE i.state='held') AS held_items \
          FROM cloud_retention_jobs j LEFT JOIN cloud_retention_scope_items i USING(job_id) \
-         WHERE j.scope_kind='personal' AND ($1::text IS NULL OR j.operator_fingerprint COLLATE \"C\" > $1 COLLATE \"C\") \
+         WHERE j.scope_kind IN ('personal','shared_organisation','orphan_organisation') AND ($1::text IS NULL OR j.operator_fingerprint COLLATE \"C\" > $1 COLLATE \"C\") \
          GROUP BY j.job_id ORDER BY j.operator_fingerprint COLLATE \"C\" LIMIT $2",
     )
     .bind(query.after.as_deref())
@@ -338,7 +338,7 @@ async fn apply_action(
     };
     let job_id: Option<String> = sqlx::query_scalar(
         "SELECT job_id FROM cloud_retention_jobs \
-         WHERE operator_fingerprint=$1 AND scope_kind='personal'",
+         WHERE operator_fingerprint=$1 AND scope_kind IN ('personal','shared_organisation','orphan_organisation')",
     )
     .bind(&fingerprint)
     .fetch_optional(&state.pool)
@@ -419,6 +419,22 @@ fn safe_reason(value: &str) -> &'static str {
         "resource_missing" => "resource_missing",
         "resource_identity_changed" => "resource_identity_changed",
         "unsupported_scope" => "unsupported_scope",
+        "owner_admin_still_eligible" => "owner_admin_still_eligible",
+        "owner_admin_eligibility_unproven" => "owner_admin_eligibility_unproven",
+        "owner_admin_population_exceeds_bound" => "owner_admin_population_exceeds_bound",
+        "owner_admin_missing" => "owner_admin_missing",
+        "orphan_without_owner_admin" => "orphan_without_owner_admin",
+        "no_verified_owner_contact" => "no_verified_owner_contact",
+        "notice_evidence_incomplete" => "notice_evidence_incomplete",
+        "notice_window_elapsed" => "notice_window_elapsed",
+        "organisation_deletion_active" => "organisation_deletion_active",
+        "ownership_transition_pending" => "ownership_transition_pending",
+        "organisation_missing" => "organisation_missing",
+        "organisation_not_active" => "organisation_not_active",
+        "scope_generation_missing" => "scope_generation_missing",
+        "scope_generation_changed" => "scope_generation_changed",
+        "eligibility_boundary_changed" => "eligibility_boundary_changed",
+        "unsupported_resource_kind" => "unsupported_resource_kind",
         "scope_owner_missing" => "scope_owner_missing",
         "episode_superseded" => "episode_superseded",
         _ => "other",
