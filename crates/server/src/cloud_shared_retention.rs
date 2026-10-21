@@ -252,7 +252,10 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
         tx.commit().await?;
         return Ok(());
     }
-    let event_key = shared_event_key(organisation_id, loss_epoch, generation);
+    // The scope generation fences the snapshot, but it is not a new eligibility-loss
+    // episode. Keep notices and the export deadline stable while resources change.
+    let event_key = shared_event_key(organisation_id, loss_epoch);
+    cancel_superseded_notices(&mut tx, organisation_id, &event_key).await?;
     let contact_available: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM cloud_verified_contacts c \
          JOIN organization_memberships m ON m.user_id=c.user_id \
@@ -345,7 +348,7 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
     .fetch_one(&mut *tx)
     .await?;
     let notices_complete = notice_count == members.len() as i64;
-    let episode = format!("shared-export:{loss_epoch}:g{generation}");
+    let episode = format!("shared-export:{loss_epoch}");
     let stored_evidence: Option<i64> = sqlx::query_scalar(
         "SELECT extract(epoch FROM notice_evidence_at)::bigint FROM cloud_retention_jobs \
          WHERE scope_kind='shared_organisation' AND scope_key=$1 AND eligibility_episode=$2",
@@ -398,6 +401,16 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
         .await?
     };
     if refresh_scope {
+        // Existing jobs are requeued as ready when their generation changes. Return the job to
+        // planned while replacing its scope items; add_scope_item_in_tx only accepts additions
+        // during that preparation state.
+        sqlx::query(
+            "UPDATE cloud_retention_jobs SET state='planned',hold_code=NULL,updated_at=now() \
+             WHERE job_id=$1 AND dry_run=TRUE AND purge_enabled=FALSE",
+        )
+        .bind(&job_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM cloud_retention_scope_items WHERE job_id=$1")
             .bind(&job_id)
             .execute(&mut *tx)
@@ -678,20 +691,35 @@ async fn cancel_other_episodes(
     Ok(())
 }
 
+async fn cancel_superseded_notices(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: &str,
+    current_event_key: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled',cancelled_at=now(), \
+             lease_owner=NULL,lease_expires_at=NULL,updated_at=now() \
+         WHERE scope_id=$1 AND policy_key=$2 AND kind='shared_export_deadline' \
+           AND event_key<>$3 AND status IN ('pending','leased')",
+    )
+    .bind(org_id)
+    .bind(SHARED_RETENTION_POLICY)
+    .bind(current_event_key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn hold_existing(pool: &PgPool, org_id: &str, reason: &str) -> Result<()> {
     sqlx::query("UPDATE cloud_retention_jobs SET state='held',hold_code=$2,lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE organisation_id=$1 AND scope_kind IN ('shared_organisation','orphan_organisation') AND state IN ('planned','ready','dry_run','held','leased') AND dry_run=TRUE AND purge_enabled=FALSE")
         .bind(org_id).bind(reason).execute(pool).await?;
     Ok(())
 }
 
-fn shared_event_key(org_id: &str, loss_epoch: i64, generation: i64) -> String {
+fn shared_event_key(org_id: &str, loss_epoch: i64) -> String {
     format!(
         "cloud-shared-export:{}",
-        fingerprint(&format!(
-            "{}:{}:{loss_epoch}:{generation}",
-            org_id.len(),
-            org_id
-        ))
+        fingerprint(&format!("{}:{}:{loss_epoch}", org_id.len(), org_id))
     )
 }
 

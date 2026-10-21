@@ -1786,6 +1786,20 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     .await
     .expect("count notices to all current administrators");
     assert_eq!(notice_count, 2);
+    let notice_rows_before_refresh: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE scope_id=$1 \
+         AND kind='shared_export_deadline' AND status<>'cancelled'",
+    )
+    .bind(&organisation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count active notices before refreshing the shared scope");
+    let original_event_key: String =
+        sqlx::query_scalar("SELECT notice_event_key FROM cloud_retention_jobs WHERE job_id=$1")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stable shared notice identity");
     let scope: Vec<(String, String)> = sqlx::query_as(
         "SELECT resource_kind,resource_id FROM cloud_retention_scope_items WHERE job_id=$1 ORDER BY resource_kind",
     )
@@ -1821,10 +1835,19 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     .await
     .expect("add a grant after the first scope snapshot");
     scan_shared_organisation(&app, &organisation_id).await;
-    let (refreshed_job_id, current_generation, refreshed_generation, refreshed_items):
-        (String, i64, i64, i64) = sqlx::query_as(
+    let (
+        refreshed_job_id,
+        current_generation,
+        refreshed_generation,
+        refreshed_items,
+        refreshed_deadline,
+        refreshed_evidence,
+        refreshed_event_key,
+    ): (String, i64, i64, i64, i64, Option<i64>, String) = sqlx::query_as(
             "SELECT job.job_id,org.retention_generation,job.expected_scope_generation, \
-                    (SELECT count(*) FROM cloud_retention_scope_items item WHERE item.job_id=job.job_id) \
+                    (SELECT count(*) FROM cloud_retention_scope_items item WHERE item.job_id=job.job_id), \
+                    extract(epoch FROM job.deadline_at)::bigint, \
+                    extract(epoch FROM job.notice_evidence_at)::bigint,job.notice_event_key \
              FROM organizations org JOIN cloud_retention_jobs job ON job.organisation_id=org.id \
              WHERE org.id=$1 AND job.scope_kind='shared_organisation' AND job.state='ready'",
         )
@@ -1833,7 +1856,73 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         .await
         .expect("read refreshed shared scope");
     assert_eq!(current_generation, refreshed_generation);
+    assert_eq!(refreshed_job_id, job_id);
     assert_eq!(refreshed_items, 5);
+    assert_eq!(refreshed_deadline, deadline);
+    assert_eq!(refreshed_evidence, evidence);
+    assert_eq!(refreshed_event_key, original_event_key);
+    let notice_rows_after_refresh: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE scope_id=$1 \
+         AND kind='shared_export_deadline' AND status<>'cancelled'",
+    )
+    .bind(&organisation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count active notices after refreshing the shared scope");
+    assert_eq!(notice_rows_after_refresh, notice_rows_before_refresh);
+
+    // A genuinely new loss boundary starts a new episode and cancels the old pending
+    // notices; a routine scope-generation bump above does neither.
+    let next_loss_epoch = loss_epoch - 3_600;
+    for user_id in [&owner_id, &admin_id] {
+        publish_authoritative_coverage(
+            &pool,
+            user_id,
+            vec![ConfirmedPaidInterval {
+                coverage_id: format!("coverage:{user_id}"),
+                source_id: format!("source:{user_id}"),
+                starts_at: next_loss_epoch - 86_400,
+                paid_until: next_loss_epoch,
+                failed_renewal_id: None,
+            }],
+            now,
+            "shared-retention-new-loss-boundary",
+        )
+        .await;
+    }
+    scan_shared_organisation(&app, &organisation_id).await;
+    let (dry_run_job_id, new_event_key, new_deadline): (String, String, i64) = sqlx::query_as(
+        "SELECT job_id,notice_event_key,extract(epoch FROM deadline_at)::bigint \
+         FROM cloud_retention_jobs WHERE organisation_id=$1 \
+           AND scope_kind='shared_organisation' AND state='ready'",
+    )
+    .bind(&organisation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the new shared loss episode");
+    assert_ne!(dry_run_job_id, refreshed_job_id);
+    assert_ne!(new_event_key, original_event_key);
+    assert!(new_deadline >= deadline);
+    let cancelled_old_notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE scope_id=$1 AND event_key=$2 \
+         AND kind='shared_export_deadline' AND status='cancelled'",
+    )
+    .bind(&organisation_id)
+    .bind(&original_event_key)
+    .fetch_one(&pool)
+    .await
+    .expect("count notices cancelled with the superseded loss episode");
+    assert_eq!(cancelled_old_notices, notice_rows_before_refresh);
+    let active_new_notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE scope_id=$1 AND event_key=$2 \
+         AND kind='shared_export_deadline' AND status<>'cancelled'",
+    )
+    .bind(&organisation_id)
+    .bind(&new_event_key)
+    .fetch_one(&pool)
+    .await
+    .expect("count notices for the new loss episode");
+    assert_eq!(active_new_notices, notice_rows_before_refresh);
 
     // Exercise the actual shared worker against a due, fully evidenced candidate. Move the
     // authoritative coverage boundary and the matching notice evidence together to model a
@@ -1857,14 +1946,8 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     }
     let dry_run_notice_epoch = now - EXPORT_WINDOW_SECONDS - 60;
     let dry_run_deadline = dry_run_notice_epoch + EXPORT_WINDOW_SECONDS;
-    let generation: i64 =
-        sqlx::query_scalar("SELECT retention_generation FROM organizations WHERE id=$1")
-            .bind(&organisation_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read organisation generation for stable notice identity");
     let event_material = format!(
-        "{}:{}:{dry_run_loss}:{generation}",
+        "{}:{}:{dry_run_loss}",
         organisation_id.len(),
         organisation_id
     );
@@ -1885,7 +1968,7 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     .bind(&dry_run_event_key)
     .bind(dry_run_notice_epoch)
     .bind(dry_run_deadline)
-    .bind(&refreshed_job_id)
+    .bind(&dry_run_job_id)
     .execute(&pool)
     .await
     .expect("model the original notice evidence for the elapsed window");
@@ -1895,11 +1978,11 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
              state='ready',hold_code=NULL \
          WHERE job_id=$1 AND scope_kind='shared_organisation'",
     )
-    .bind(&refreshed_job_id)
+    .bind(&dry_run_job_id)
     .bind(dry_run_deadline)
     .bind(&dry_run_event_key)
     .bind(dry_run_notice_epoch)
-    .bind(format!("shared-export:{dry_run_loss}:g{generation}"))
+    .bind(format!("shared-export:{dry_run_loss}"))
     .bind(dry_run_loss)
     .execute(&pool)
     .await
@@ -1908,7 +1991,7 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         "UPDATE cloud_retention_jobs SET expected_scope_generation=( \
              SELECT retention_generation FROM organizations WHERE id=$2) WHERE job_id=$1",
     )
-    .bind(&refreshed_job_id)
+    .bind(&dry_run_job_id)
     .bind(&organisation_id)
     .execute(&pool)
     .await
@@ -1917,10 +2000,10 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         .await
         .expect("run the bounded shared dry-run worker")
         .expect("claim the due shared candidate");
-    assert_eq!(run.job_id, refreshed_job_id);
+    assert_eq!(run.job_id, dry_run_job_id);
     let dry_run_hold: Option<String> =
         sqlx::query_scalar("SELECT hold_code FROM cloud_retention_jobs WHERE job_id=$1")
-            .bind(&refreshed_job_id)
+            .bind(&dry_run_job_id)
             .fetch_one(&pool)
             .await
             .expect("read shared dry-run hold, if any");
@@ -1932,14 +2015,14 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     assert_eq!(run.processed_items, 5);
     assert_eq!(run.held_items, 0);
     assert!(matches!(
-        retention::enable_purge(&pool, &refreshed_job_id).await,
+        retention::enable_purge(&pool, &dry_run_job_id).await,
         Err(retention::RetentionError::Held(
             "purge prerequisites are not met"
         ))
     ));
     let purge_enabled: bool =
         sqlx::query_scalar("SELECT purge_enabled FROM cloud_retention_jobs WHERE job_id=$1")
-            .bind(&refreshed_job_id)
+            .bind(&dry_run_job_id)
             .fetch_one(&pool)
             .await
             .expect("confirm shared dry run cannot enable purge");
@@ -1947,7 +2030,7 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     let dry_run_scope_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND state='dry_run'",
     )
-    .bind(&refreshed_job_id)
+    .bind(&dry_run_job_id)
     .fetch_one(&pool)
     .await
     .expect("read completed dry-run scope");
@@ -1956,7 +2039,7 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         "SELECT (SELECT count(*) FROM cloud_retention_receipts WHERE job_id=$1) + \
                 (SELECT count(*) FROM cloud_retention_tombstone_journal WHERE job_id=$1)",
     )
-    .bind(&refreshed_job_id)
+    .bind(&dry_run_job_id)
     .fetch_one(&pool)
     .await
     .expect("check that dry run created no deletion evidence");
@@ -2096,7 +2179,7 @@ async fn shared_dry_run_holds_when_scope_changes_while_waiting_for_organisation_
     .await;
     let dry_run_deadline = dry_run_loss + EXPORT_WINDOW_SECONDS;
     let event_material = format!(
-        "{}:{}:{dry_run_loss}:{dry_run_deadline}",
+        "{}:{}:{dry_run_loss}",
         organisation_id.len(),
         organisation_id
     );
