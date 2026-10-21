@@ -299,5 +299,20 @@ async fn ambiguous_refund_create_parks_before_provider_idempotency_expires() {
     .await
     .expect("read account after ambiguous refund");
     assert_eq!(account, ("active".into(), 1_901_000_000));
+
+    let mut tx = pool.begin().await.expect("begin operator resolution");
+    let resolved = record_provider_pending(&mut tx, &request.request_id, "re_found_by_operator")
+        .await
+        .expect("accept only the refund id found and verified by the operator route");
+    assert_eq!(resolved.state, CorrectionState::ProviderPending);
+    assert_eq!(
+        resolved.provider_refund_id.as_deref(),
+        Some("re_found_by_operator")
+    );
+    assert_eq!(
+        resolved.provider_refund_started_at_epoch,
+        Some(first_attempt)
+    );
+    tx.commit().await.expect("commit verified refund reference");
     cleanup(&pool, &fixture).await;
 }

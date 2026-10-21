@@ -461,7 +461,9 @@ pub async fn record_provider_pending(
             {
                 return Err(BillingRefundError::RequestConflict);
             }
-            if current.provider_refund_id.is_none() {
+            if current.provider_refund_id.is_none()
+                && current.result_code.as_deref() != Some("refund_create_horizon_expired")
+            {
                 return Err(BillingRefundError::InvalidTransition);
             }
         }
