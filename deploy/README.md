@@ -179,12 +179,13 @@ non-Cloud deployment mode. Keep this switch off
 until the current retention policy, customer notices, exact candidate scope, backup and tombstone
 restore rehearsal have all been independently reviewed. Enabling it does not delete anything by
 itself: a reviewer must register signed restore evidence, inspect the opaque scope fingerprint,
-and approve the exact dry-run candidate. Before each bounded batch the worker rechecks the live
-approval, scope, eligibility, notice and restore-evidence journal count. A successful batch adds
-tombstones, invalidates that approval, and holds the remaining work for a fresh restore rehearsal
-and approval. The destructive operator label is audit text, not an authenticated individual; use
-the credentials only through the protected operator channel and do not place them in logs or
-support messages.
+and approve the exact dry-run candidate. An `operator_hold` can be lifted only by explicitly
+approving the current scope with fresh restore evidence. Before each bounded batch the worker
+rechecks the live approval, scope, eligibility, notice and restore-evidence journal count. A
+successful batch adds tombstones, invalidates that approval, and holds the remaining work for a
+fresh restore rehearsal and approval. The destructive operator label is audit text, not an
+authenticated individual; use the credentials only through the protected operator channel and do
+not place them in logs or support messages.
 
 On a 1 GB host, give the kernel some headroom before the first start:
 

@@ -1650,6 +1650,154 @@ async fn changed_environment_revision_is_held_without_deletion() {
 }
 
 #[tokio::test]
+async fn purge_checks_environment_identity_before_deleting_its_grant_or_token() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let user_id = format!("retention-purge-drift-user-{suffix}");
+    let organisation_id = format!("unused-retention-purge-drift-org-{suffix}");
+    let project_id = format!("retention-purge-drift-project-{suffix}");
+    let environment_id = format!("retention-purge-drift-env-{suffix}");
+    let token_id = format!("retention-purge-drift-token-{suffix}");
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    cleanup(&pool, &user_id, &organisation_id).await;
+    seed_user(&pool, &user_id).await;
+    let (start, deadline) = seed_expired_projection(&pool, &user_id, now).await;
+    seed_notice(&pool, &user_id, start, deadline, start - 60).await;
+    sqlx::query("INSERT INTO projects(id,owner_id,enc_name) VALUES($1,$2,decode('21','hex'))")
+        .bind(&project_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("seed personal project");
+    sqlx::query(
+        "INSERT INTO environments(id,project_id,enc_name,revision) \
+         VALUES($1,$2,decode('22','hex'),7)",
+    )
+    .bind(&environment_id)
+    .bind(&project_id)
+    .execute(&pool)
+    .await
+    .expect("seed personal environment");
+    sqlx::query(
+        "INSERT INTO environment_grants(env_id,user_id,enc_vault_key) \
+         VALUES($1,$2,decode('23','hex'))",
+    )
+    .bind(&environment_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed wrapped owner key");
+    sqlx::query(
+        "INSERT INTO machine_tokens(id,env_id,name,token_hash,public_key,enc_vault_key,created_by,expires_at,beneficiary_id,beneficiary_status) \
+         VALUES($1,$2,'retention-test',$3,decode('24','hex'),decode('25','hex'),$4,now()+interval '7 days',$4,'verified')",
+    )
+    .bind(&token_id)
+    .bind(&environment_id)
+    .bind(suffix.as_bytes().to_vec())
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed environment token");
+
+    let app = state(pool.clone());
+    sotto_server::cloud_retention_lifecycle::reconcile_user(&app, &user_id)
+        .await
+        .expect("prepare personal retention scope");
+    let job_id: String = sqlx::query_scalar(
+        "SELECT job_id FROM cloud_retention_jobs WHERE scope_key=$1 AND scope_kind='personal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load personal retention job");
+    let dry_run = retention::run_dry_run_once(&pool, "personal-retention-drift-dry-run")
+        .await
+        .expect("run personal dry-run")
+        .expect("claim dry-run");
+    assert_eq!(dry_run.state.as_str(), "dry_run");
+    let fingerprint = retention::review_scope_fingerprint(&pool, &job_id)
+        .await
+        .expect("fingerprint exact scope");
+    let release_sha = "a".repeat(40);
+    let evidence_key = b"separate personal retention restore evidence key";
+    let journal_entry_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_tombstone_journal")
+            .fetch_one(&pool)
+            .await
+            .expect("count current tombstones");
+    let mut evidence = retention::RestoreEvidenceAttestation {
+        evidence_id: format!("restore-evidence:purge-drift-{suffix}"),
+        release_sha: release_sha.clone(),
+        backup_fingerprint: "b".repeat(64),
+        sidecar_sha256: "c".repeat(64),
+        journal_entry_count,
+        replay_entry_count: journal_entry_count,
+        first_replay_deleted_count: journal_entry_count,
+        second_replay_deleted_count: 0,
+        incarnation_guard_verified: true,
+        signature: String::new(),
+    };
+    evidence.signature = retention::sign_restore_evidence(&evidence, evidence_key);
+    retention::register_restore_evidence(
+        &pool,
+        &evidence,
+        evidence_key,
+        &release_sha,
+        "retention-test",
+    )
+    .await
+    .expect("register signed restore evidence");
+    retention::approve_purge(
+        &pool,
+        &job_id,
+        &fingerprint,
+        &evidence.evidence_id,
+        "retention-reviewer",
+        &release_sha,
+    )
+    .await
+    .expect("approve exact reviewed scope");
+
+    sqlx::query("UPDATE environments SET revision=revision+1 WHERE id=$1")
+        .bind(&environment_id)
+        .execute(&pool)
+        .await
+        .expect("simulate environment change after approval");
+    let purge =
+        retention::run_approved_purge_once(&pool, "personal-retention-drift-purge", &release_sha)
+            .await
+            .expect("hold on changed environment identity")
+            .expect("claim approved purge");
+    assert_eq!(purge.state.as_str(), "held");
+    assert_eq!(purge.processed_items, 0);
+    assert_eq!(purge.held_items, 1);
+
+    let (environment_exists, grants, tokens, receipts, tombstones): (bool, i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM environments WHERE id=$2), \
+                    (SELECT count(*) FROM environment_grants WHERE env_id=$2), \
+                    (SELECT count(*) FROM machine_tokens WHERE id=$3), \
+                    (SELECT count(*) FROM cloud_retention_receipts WHERE job_id=$1), \
+                    (SELECT count(*) FROM cloud_retention_tombstone_journal WHERE job_id=$1)",
+        )
+        .bind(&job_id)
+        .bind(&environment_id)
+        .bind(&token_id)
+        .fetch_one(&pool)
+        .await
+        .expect("verify resources survived identity hold");
+    assert!(environment_exists);
+    assert_eq!((grants, tokens, receipts, tombstones), (1, 1, 0, 0));
+    cleanup(&pool, &user_id, &organisation_id).await;
+}
+
+#[tokio::test]
 async fn bounded_scan_is_dark_until_enabled_and_persists_its_cursor() {
     let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {

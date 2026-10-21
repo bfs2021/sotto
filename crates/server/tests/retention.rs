@@ -380,7 +380,7 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
 }
 
 #[tokio::test]
-async fn generic_worker_cannot_purge_a_recreated_project() {
+async fn generic_worker_cannot_purge_even_a_recreated_project() {
     let _guard = retention_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;

@@ -1680,6 +1680,65 @@ async fn run_once_with_scope(
         }
     }
 
+    // Validate and lock the complete remaining scope before deleting any child. Parent rows
+    // are checked first, so a changed environment or project cannot be discovered only after
+    // its wrapped key or token has already been removed.
+    if mode == RetentionMode::Purge {
+        let remaining_items = sqlx::query(
+            "SELECT resource_kind,resource_id,ownership_kind,expected_created_at,expected_revision \
+             FROM cloud_retention_scope_items WHERE job_id=$1 AND state='dry_run' \
+             ORDER BY CASE resource_kind WHEN 'project' THEN 0 WHEN 'environment' THEN 1 \
+                      WHEN 'grant' THEN 2 WHEN 'machine_token' THEN 3 ELSE 4 END, \
+                      resource_kind COLLATE \"C\",resource_id COLLATE \"C\" FOR UPDATE",
+        )
+        .bind(&lease.job_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for item in remaining_items {
+            let kind: String = item.try_get("resource_kind")?;
+            let id: String = item.try_get("resource_id")?;
+            let ownership: String = item.try_get("ownership_kind")?;
+            let created: i64 = item.try_get("expected_created_at")?;
+            let revision: Option<i64> = item.try_get("expected_revision")?;
+            let reason = if lease.scope_kind == ScopeKind::Personal.as_str() {
+                validate_dry_run_resource(
+                    &mut tx, &lease, &kind, &id, &ownership, created, revision,
+                )
+                .await?
+            } else {
+                validate_shared_resource(&mut tx, &lease, &kind, &id, created, revision).await?
+            };
+            if let Some(reason) = reason.filter(|reason| *reason != "resource_missing") {
+                sqlx::query(
+                    "UPDATE cloud_retention_scope_items SET state='held',hold_code=$4,updated_at=now() \
+                     WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3 AND state='dry_run'",
+                )
+                .bind(&lease.job_id)
+                .bind(&kind)
+                .bind(&id)
+                .bind(reason)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE cloud_retention_purge_approvals SET state='stale',invalidated_at=now() \
+                     WHERE job_id=$1 AND state='active'",
+                )
+                .bind(&lease.job_id)
+                .execute(&mut *tx)
+                .await?;
+                set_job_hold(&mut tx, &lease, reason).await?;
+                tx.commit().await?;
+                return Ok(Some(RetentionRun {
+                    job_id: lease.job_id,
+                    state: RetentionState::Held,
+                    dry_run: false,
+                    processed_items: 0,
+                    held_items: 1,
+                }));
+            }
+        }
+    }
+
     let item_state = if mode == RetentionMode::DryRun {
         "planned"
     } else {
@@ -2837,58 +2896,78 @@ async fn validate_shared_resource(
         .organisation_id
         .as_deref()
         .ok_or(RetentionError::Held("organisation scope is missing"))?;
-    let found =
-        match kind {
-            "project" => {
-                sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1 AND org_id=$2 \
-             AND (extract(epoch FROM created_at)*1000000)::bigint=$3)",
-                )
-                .bind(id)
-                .bind(org_id)
-                .bind(created)
-                .fetch_one(&mut **tx)
-                .await?
-            }
-            "environment" => sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM environments e JOIN projects p ON p.id=e.project_id \
-             WHERE e.id=$1 AND p.org_id=$2 AND e.revision=$3 \
-               AND (extract(epoch FROM e.created_at)*1000000)::bigint=$4)",
+    let found = match kind {
+        "project" => {
+            let row = sqlx::query(
+                "SELECT (extract(epoch FROM created_at)*1000000)::bigint AS created_epoch \
+                 FROM projects WHERE id=$1 AND org_id=$2 FOR UPDATE",
             )
             .bind(id)
             .bind(org_id)
-            .bind(revision)
-            .bind(created)
-            .fetch_one(&mut **tx)
-            .await?,
-            "grant" => {
-                sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM environment_grants g \
-                 JOIN environments e ON e.id=g.env_id JOIN projects p ON p.id=e.project_id \
-                 WHERE p.org_id=$2 AND jsonb_build_array(g.env_id,g.user_id)=$1::jsonb \
-                   AND (extract(epoch FROM g.created_at)*1000000)::bigint=$3)",
-                )
-                .bind(id)
-                .bind(org_id)
-                .bind(created)
-                .fetch_one(&mut **tx)
-                .await?
+            .fetch_optional(&mut **tx)
+            .await?;
+            row.map(|row| row.try_get::<i64, _>("created_epoch"))
+                .transpose()?
+                == Some(created)
+        }
+        "environment" => {
+            let row = sqlx::query(
+                "SELECT e.revision, \
+                            (extract(epoch FROM e.created_at)*1000000)::bigint AS created_epoch \
+                     FROM environments e JOIN projects p ON p.id=e.project_id \
+                     WHERE e.id=$1 AND p.org_id=$2 FOR UPDATE OF e,p",
+            )
+            .bind(id)
+            .bind(org_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            match row {
+                None => false,
+                Some(row) => {
+                    let actual_revision: i64 = row.try_get("revision")?;
+                    let actual_created: i64 = row.try_get("created_epoch")?;
+                    Some(actual_revision) == revision && actual_created == created
+                }
             }
-            "machine_token" => {
-                sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM machine_tokens m \
-                 JOIN environments e ON e.id=m.env_id JOIN projects p ON p.id=e.project_id \
-                 WHERE p.org_id=$2 AND jsonb_build_array(m.id,m.env_id)=$1::jsonb \
-                   AND (extract(epoch FROM m.created_at)*1000000)::bigint=$3)",
-                )
-                .bind(id)
-                .bind(org_id)
-                .bind(created)
-                .fetch_one(&mut **tx)
-                .await?
-            }
-            _ => return Ok(Some("unsupported_resource_kind")),
-        };
+        }
+        "grant" => {
+            let parts = parse_composite_resource_id(id)?;
+            let row = sqlx::query(
+                "SELECT (extract(epoch FROM g.created_at)*1000000)::bigint AS created_epoch \
+                 FROM environment_grants g JOIN environments e ON e.id=g.env_id \
+                 JOIN projects p ON p.id=e.project_id \
+                 WHERE g.env_id=$1 AND g.user_id=$2 AND p.org_id=$3 \
+                 FOR UPDATE OF g,e,p",
+            )
+            .bind(&parts[0])
+            .bind(&parts[1])
+            .bind(org_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            row.map(|row| row.try_get::<i64, _>("created_epoch"))
+                .transpose()?
+                == Some(created)
+        }
+        "machine_token" => {
+            let parts = parse_composite_resource_id(id)?;
+            let row = sqlx::query(
+                "SELECT (extract(epoch FROM m.created_at)*1000000)::bigint AS created_epoch \
+                 FROM machine_tokens m JOIN environments e ON e.id=m.env_id \
+                 JOIN projects p ON p.id=e.project_id \
+                 WHERE m.id=$1 AND m.env_id=$2 AND p.org_id=$3 \
+                 FOR UPDATE OF m,e,p",
+            )
+            .bind(&parts[0])
+            .bind(&parts[1])
+            .bind(org_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            row.map(|row| row.try_get::<i64, _>("created_epoch"))
+                .transpose()?
+                == Some(created)
+        }
+        _ => return Ok(Some("unsupported_resource_kind")),
+    };
     Ok((!found).then_some("resource_identity_changed"))
 }
 
@@ -3011,38 +3090,69 @@ async fn validate_dry_run_resource(
         }
         "grant" => {
             let parts = parse_composite_resource_id(resource_id)?;
-            let found: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM environment_grants g \
-                 JOIN environments e ON e.id=g.env_id JOIN projects p ON p.id=e.project_id \
-                 WHERE g.env_id=$1 AND g.user_id=$2 AND p.owner_id=$3 AND p.org_id IS NULL \
-                   AND g.user_id=p.owner_id \
-                   AND (extract(epoch FROM g.created_at)*1000000)::bigint=$4)",
+            let row = sqlx::query(
+                "SELECT g.user_id=p.owner_id AS owner_grant, \
+                        p.owner_id, p.org_id, \
+                        (extract(epoch FROM g.created_at)*1000000)::bigint AS created_epoch, \
+                        EXISTS (SELECT 1 FROM environment_grants other \
+                                WHERE other.env_id=e.id AND other.user_id<>p.owner_id) AS shared \
+                 FROM environment_grants g JOIN environments e ON e.id=g.env_id \
+                 JOIN projects p ON p.id=e.project_id \
+                 WHERE g.env_id=$1 AND g.user_id=$2 FOR UPDATE OF g,e,p",
             )
             .bind(&parts[0])
             .bind(&parts[1])
-            .bind(subject)
-            .bind(expected_created_at)
-            .fetch_one(&mut **tx)
+            .fetch_optional(&mut **tx)
             .await?;
-            (!found).then_some("resource_identity_changed")
+            match row {
+                None => Some("resource_missing"),
+                Some(row) => {
+                    let owner_grant: bool = row.try_get("owner_grant")?;
+                    let owner: String = row.try_get("owner_id")?;
+                    let organisation: Option<String> = row.try_get("org_id")?;
+                    let created: i64 = row.try_get("created_epoch")?;
+                    let shared: bool = row.try_get("shared")?;
+                    if owner != subject || organisation.is_some() || shared || !owner_grant {
+                        Some("shared_resource")
+                    } else if created != expected_created_at {
+                        Some("resource_identity_changed")
+                    } else {
+                        None
+                    }
+                }
+            }
         }
         "machine_token" => {
             let parts = parse_composite_resource_id(resource_id)?;
-            let found: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM machine_tokens m \
-                 JOIN environments e ON e.id=m.env_id JOIN projects p ON p.id=e.project_id \
-                 WHERE m.id=$1 AND m.env_id=$2 AND p.owner_id=$3 AND p.org_id IS NULL \
-                   AND NOT EXISTS (SELECT 1 FROM environment_grants g \
-                                   WHERE g.env_id=e.id AND g.user_id<>p.owner_id) \
-                   AND (extract(epoch FROM m.created_at)*1000000)::bigint=$4)",
+            let row = sqlx::query(
+                "SELECT p.owner_id, p.org_id, \
+                        (extract(epoch FROM m.created_at)*1000000)::bigint AS created_epoch, \
+                        EXISTS (SELECT 1 FROM environment_grants g \
+                                WHERE g.env_id=e.id AND g.user_id<>p.owner_id) AS shared \
+                 FROM machine_tokens m JOIN environments e ON e.id=m.env_id \
+                 JOIN projects p ON p.id=e.project_id \
+                 WHERE m.id=$1 AND m.env_id=$2 FOR UPDATE OF m,e,p",
             )
             .bind(&parts[0])
             .bind(&parts[1])
-            .bind(subject)
-            .bind(expected_created_at)
-            .fetch_one(&mut **tx)
+            .fetch_optional(&mut **tx)
             .await?;
-            (!found).then_some("resource_identity_changed")
+            match row {
+                None => Some("resource_missing"),
+                Some(row) => {
+                    let owner: String = row.try_get("owner_id")?;
+                    let organisation: Option<String> = row.try_get("org_id")?;
+                    let created: i64 = row.try_get("created_epoch")?;
+                    let shared: bool = row.try_get("shared")?;
+                    if owner != subject || organisation.is_some() || shared {
+                        Some("shared_resource")
+                    } else if created != expected_created_at {
+                        Some("resource_identity_changed")
+                    } else {
+                        None
+                    }
+                }
+            }
         }
         _ => return Err(RetentionError::InvalidInput("resource_kind")),
     };
