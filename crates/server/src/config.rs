@@ -529,6 +529,7 @@ impl Config {
             cloud_retention_evidence_hmac_key.as_deref(),
             cloud_retention_build_sha.as_deref(),
             deployment_mode,
+            option_env!("SOTTO_COMPILED_BUILD_SHA"),
         )?;
         let cloud_action_enforcement_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_ACTION_ENFORCEMENT_ENV).ok().as_deref());
@@ -1042,6 +1043,7 @@ fn validate_cloud_retention_purge_configuration(
     evidence_hmac_key: Option<&str>,
     build_sha: Option<&str>,
     deployment_mode: DeploymentMode,
+    compiled_build_sha: Option<&str>,
 ) -> Result<()> {
     let any_purge_setting = purge_enabled
         || destructive_token.is_some()
@@ -1080,6 +1082,11 @@ fn validate_cloud_retention_purge_configuration(
         {
             return Err(Error::Config(
                 "SOTTO_CLOUD_RETENTION_BUILD_SHA must be a lowercase commit SHA".into(),
+            ));
+        }
+        if compiled_build_sha != Some(sha) {
+            return Err(Error::Config(
+                "SOTTO_CLOUD_RETENTION_BUILD_SHA must match the commit SHA embedded in this server build".into(),
             ));
         }
     }
@@ -1720,7 +1727,8 @@ mod tests {
             None,
             None,
             None,
-            DeploymentMode::SelfHosted
+            DeploymentMode::SelfHosted,
+            None,
         )
         .is_ok());
         assert!(validate_cloud_retention_purge_configuration(
@@ -1730,6 +1738,7 @@ mod tests {
             Some(&signing_key),
             Some(&sha),
             DeploymentMode::Cloud,
+            Some(&sha),
         )
         .is_ok());
         assert!(validate_cloud_retention_purge_configuration(
@@ -1739,6 +1748,27 @@ mod tests {
             Some(&signing_key),
             Some(&sha),
             DeploymentMode::Cloud,
+            Some(&sha),
+        )
+        .is_err());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&destructive),
+            Some(&signing_key),
+            Some(&sha),
+            DeploymentMode::Cloud,
+            Some(&"b".repeat(40)),
+        )
+        .is_err());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&destructive),
+            Some(&signing_key),
+            Some(&sha),
+            DeploymentMode::Cloud,
+            None,
         )
         .is_err());
         assert!(validate_cloud_retention_purge_configuration(
@@ -1748,6 +1778,7 @@ mod tests {
             None,
             Some(&sha),
             DeploymentMode::Cloud,
+            Some(&sha),
         )
         .is_err());
         assert!(validate_cloud_retention_purge_configuration(
@@ -1757,8 +1788,17 @@ mod tests {
             Some(&signing_key),
             Some("not-a-commit"),
             DeploymentMode::Cloud,
+            Some(&sha),
         )
         .is_err());
+    }
+
+    #[test]
+    fn build_sha_is_embedded_from_the_build_argument() {
+        let expected = std::env::var("SOTTO_BUILD_SHA")
+            .ok()
+            .filter(|value| !value.is_empty());
+        assert_eq!(option_env!("SOTTO_COMPILED_BUILD_SHA"), expected.as_deref());
     }
 
     #[test]

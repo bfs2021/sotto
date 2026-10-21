@@ -169,8 +169,13 @@ codes, counts, deadlines, and opaque job fingerprints. `hold`, `cancel`, and `re
 enable purge; an operator-supplied label is audit text, not an authenticated identity. A successful
 dry run is review evidence, not permission to delete data. The purge route and worker have a
 separate default-off gate: `SOTTO_CLOUD_RETENTION_PURGE_ENABLED=1`. They also require a distinct
-destructive operator token, a separate evidence HMAC key, and the exact running build SHA; the
-server refuses incomplete configuration and non-Cloud deployment mode. Keep this switch off
+destructive operator token, a separate evidence HMAC key, and the exact running build SHA. The
+server binary embeds its build SHA, and startup rejects a runtime SHA that differs from that
+compiled identity. Published images embed the GitHub commit that built them. For a source build,
+set `SOTTO_BUILD_SHA` to the checked-out commit before building and set
+`SOTTO_CLOUD_RETENTION_BUILD_SHA` to the same value at runtime. A source build without embedded
+identity cannot mount or run purge controls. The server refuses incomplete configuration and
+non-Cloud deployment mode. Keep this switch off
 until the current retention policy, customer notices, exact candidate scope, backup and tombstone
 restore rehearsal have all been independently reviewed. Enabling it does not delete anything by
 itself: a reviewer must register signed restore evidence, inspect the opaque scope fingerprint,
