@@ -69,6 +69,10 @@ fn state(pool: PgPool) -> AppState {
         cloud_retention_dry_run_enabled: true,
         cloud_shared_retention_dry_run_enabled: true,
         cloud_retention_operator_token: Some("0123456789abcdef0123456789abcdef".into()),
+        cloud_retention_purge_enabled: false,
+        cloud_retention_destructive_token: None,
+        cloud_retention_evidence_hmac_key: None,
+        cloud_retention_build_sha: None,
     }
 }
 
@@ -358,6 +362,22 @@ async fn seed_notice(pool: &PgPool, user_id: &str, start: i64, deadline: i64, cr
 }
 
 async fn cleanup(pool: &PgPool, user_id: &str, organisation_id: &str) {
+    sqlx::query(
+        "DELETE FROM cloud_retention_purge_approvals WHERE job_id IN \
+         (SELECT job_id FROM cloud_retention_jobs WHERE scope_key=$1)",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("remove purge approvals");
+    sqlx::query(
+        "DELETE FROM cloud_retention_receipts WHERE job_id IN \
+         (SELECT job_id FROM cloud_retention_jobs WHERE scope_key=$1)",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("remove purge receipts");
     sqlx::query(
         "DELETE FROM cloud_retention_operator_actions WHERE job_id IN \
          (SELECT job_id FROM cloud_retention_jobs WHERE scope_key=$1)",
@@ -980,7 +1000,7 @@ async fn expiry_dry_run_snapshots_only_personal_data_and_never_deletes_rows() {
         .expect("run dry run")
         .expect("due job claimed");
     assert_eq!(run.state.as_str(), "dry_run");
-    assert_eq!(run.held_items, 3);
+    assert_eq!(run.held_items, 4);
     let dry_run_shares: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND resource_kind='share' AND state='dry_run'",
     )
@@ -1109,6 +1129,231 @@ async fn expiry_dry_run_snapshots_only_personal_data_and_never_deletes_rows() {
     assert!(!purge_enabled);
     cleanup(&pool, &user_id, &organisation_id).await;
     cleanup(&pool, &other_user_id, &format!("unused-{suffix}")).await;
+}
+
+#[tokio::test]
+async fn personal_retention_purge_requires_signed_review_and_preserves_the_user() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let user_id = format!("retention-purge-user-{suffix}");
+    let project_id = format!("retention-purge-project-{suffix}");
+    let environment_id = format!("retention-purge-environment-{suffix}");
+    let token_id = format!("retention-purge-token-{suffix}");
+    let organisation_id = format!("unused-retention-purge-org-{suffix}");
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    cleanup(&pool, &user_id, &organisation_id).await;
+    seed_user(&pool, &user_id).await;
+    sqlx::query("INSERT INTO projects(id,owner_id,enc_name) VALUES($1,$2,decode('11','hex'))")
+        .bind(&project_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("seed personal purge project");
+    sqlx::query(
+        "INSERT INTO projects(id,owner_id,enc_name) \
+         SELECT 'retention-purge-extra-' || $1 || '-' || n::text,$2,decode('11','hex') \
+         FROM generate_series(1,64) AS n",
+    )
+    .bind(suffix.to_string())
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed projects across two bounded purge batches");
+    sqlx::query(
+        "INSERT INTO environments(id,project_id,enc_name,revision) \
+         VALUES($1,$2,decode('12','hex'),1)",
+    )
+    .bind(&environment_id)
+    .bind(&project_id)
+    .execute(&pool)
+    .await
+    .expect("seed personal purge environment");
+    sqlx::query(
+        "INSERT INTO environment_grants(env_id,user_id,enc_vault_key) \
+         VALUES($1,$2,decode('13','hex'))",
+    )
+    .bind(&environment_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed personal environment grant");
+    sqlx::query(
+        "INSERT INTO machine_tokens(id,env_id,name,token_hash,public_key,enc_vault_key,created_by,expires_at,beneficiary_id,beneficiary_status) \
+         VALUES($1,$2,'retention-test',$3,decode('14','hex'),decode('15','hex'),$4,now()+interval '7 days',$4,'verified')",
+    )
+    .bind(&token_id)
+    .bind(&environment_id)
+    .bind(suffix.as_bytes().to_vec())
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed personal machine token");
+    let (notice_start, deadline) = seed_expired_projection(&pool, &user_id, now).await;
+    seed_notice(&pool, &user_id, notice_start, deadline, notice_start - 60).await;
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled',cancelled_at=now() \
+         WHERE recipient_user_id=$1 AND event_key=$2",
+    )
+    .bind(&user_id)
+    .bind(format!("cloud-export-window:{notice_start}:{deadline}"))
+    .execute(&pool)
+    .await
+    .expect("retain notice evidence after its delivery window");
+    let app = state(pool.clone());
+    sotto_server::cloud_retention_lifecycle::reconcile_user(&app, &user_id)
+        .await
+        .expect("prepare personal retention scope");
+    let job_id: String = sqlx::query_scalar(
+        "SELECT job_id FROM cloud_retention_jobs WHERE scope_key=$1 AND scope_kind='personal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load personal retention job");
+    let first_dry_run = retention::run_dry_run_once(&pool, "personal-retention-dry-run")
+        .await
+        .expect("run first personal dry-run batch")
+        .expect("claim first personal dry-run batch");
+    assert_eq!(first_dry_run.state.as_str(), "ready");
+    let final_dry_run = retention::run_dry_run_once(&pool, "personal-retention-dry-run")
+        .await
+        .expect("run final personal dry-run batch")
+        .expect("claim final personal dry-run batch");
+    assert_eq!(final_dry_run.state.as_str(), "dry_run");
+    let scope_fingerprint = retention::review_scope_fingerprint(&pool, &job_id)
+        .await
+        .expect("fingerprint exact personal scope");
+    let release_sha = "d".repeat(40);
+    let evidence_key = b"separate personal retention restore evidence key";
+    let journal_entry_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_tombstone_journal")
+            .fetch_one(&pool)
+            .await
+            .expect("count current tombstones");
+    let mut evidence = retention::RestoreEvidenceAttestation {
+        evidence_id: format!("restore-evidence:personal-{suffix}"),
+        release_sha: release_sha.clone(),
+        backup_fingerprint: "e".repeat(64),
+        sidecar_sha256: "f".repeat(64),
+        journal_entry_count,
+        replay_entry_count: journal_entry_count,
+        first_replay_deleted_count: journal_entry_count,
+        second_replay_deleted_count: 0,
+        incarnation_guard_verified: true,
+        signature: String::new(),
+    };
+    evidence.signature = retention::sign_restore_evidence(&evidence, evidence_key);
+    retention::register_restore_evidence(
+        &pool,
+        &evidence,
+        evidence_key,
+        &release_sha,
+        "retention-test",
+    )
+    .await
+    .expect("register signed restore evidence");
+    retention::approve_purge(
+        &pool,
+        &job_id,
+        &scope_fingerprint,
+        &evidence.evidence_id,
+        "retention-reviewer",
+        &release_sha,
+    )
+    .await
+    .expect("approve exact reviewed personal scope");
+    let purge =
+        retention::run_approved_purge_once(&pool, "personal-retention-purge-worker", &release_sha)
+            .await
+            .expect("execute approved personal purge")
+            .expect("claim approved personal purge");
+    assert_eq!(purge.state.as_str(), "held");
+    assert_eq!(purge.processed_items, 64);
+    let first_batch: (i64, i64, String) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_retention_receipts WHERE job_id=$1), \
+                (SELECT count(*) FROM cloud_retention_tombstone_journal WHERE job_id=$1), \
+                (SELECT state FROM cloud_retention_purge_approvals WHERE job_id=$1 \
+                 ORDER BY approved_at DESC LIMIT 1)",
+    )
+    .bind(&job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect first bounded purge batch");
+    assert_eq!(first_batch, (64, 64, "stale".into()));
+    assert!(matches!(
+        retention::run_approved_purge_once(&pool, "personal-retention-purge-worker", &release_sha)
+            .await,
+        Ok(None)
+    ));
+    let updated_journal_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_tombstone_journal")
+            .fetch_one(&pool)
+            .await
+            .expect("count tombstones after first purge batch");
+    let mut updated_evidence = retention::RestoreEvidenceAttestation {
+        evidence_id: format!("restore-evidence:personal-follow-up-{suffix}"),
+        release_sha: release_sha.clone(),
+        backup_fingerprint: "1".repeat(64),
+        sidecar_sha256: "2".repeat(64),
+        journal_entry_count: updated_journal_count,
+        replay_entry_count: updated_journal_count,
+        first_replay_deleted_count: updated_journal_count,
+        second_replay_deleted_count: 0,
+        incarnation_guard_verified: true,
+        signature: String::new(),
+    };
+    updated_evidence.signature = retention::sign_restore_evidence(&updated_evidence, evidence_key);
+    retention::register_restore_evidence(
+        &pool,
+        &updated_evidence,
+        evidence_key,
+        &release_sha,
+        "retention-test",
+    )
+    .await
+    .expect("register fresh restore evidence after journal changed");
+    retention::approve_purge(
+        &pool,
+        &job_id,
+        &scope_fingerprint,
+        &updated_evidence.evidence_id,
+        "retention-reviewer",
+        &release_sha,
+    )
+    .await
+    .expect("require fresh approval after first bounded batch");
+    let final_purge =
+        retention::run_approved_purge_once(&pool, "personal-retention-purge-worker", &release_sha)
+            .await
+            .expect("execute second approved personal purge batch")
+            .expect("claim second approved personal purge batch");
+    assert_eq!(final_purge.state.as_str(), "completed");
+    let users_remain: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("verify account remains intact");
+    assert!(users_remain);
+    let resources_remain: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1) OR \
+                EXISTS(SELECT 1 FROM environments WHERE id=$2) OR \
+                EXISTS(SELECT 1 FROM environment_grants WHERE env_id=$2) OR \
+                EXISTS(SELECT 1 FROM machine_tokens WHERE id=$3)",
+    )
+    .bind(&project_id)
+    .bind(&environment_id)
+    .bind(&token_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verify personal scope children and parents were deleted");
+    assert!(!resources_remain);
+    cleanup(&pool, &user_id, &organisation_id).await;
 }
 
 #[tokio::test]
@@ -1603,6 +1848,22 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         .execute(&pool)
         .await
         .expect("remove previous shared operator actions");
+        sqlx::query(
+            "DELETE FROM cloud_retention_purge_approvals WHERE job_id IN \
+             (SELECT job_id FROM cloud_retention_jobs WHERE organisation_id=$1)",
+        )
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("remove previous shared purge approvals");
+        sqlx::query(
+            "DELETE FROM cloud_retention_receipts WHERE job_id IN \
+             (SELECT job_id FROM cloud_retention_jobs WHERE organisation_id=$1)",
+        )
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("remove previous shared purge receipts");
         sqlx::query("DELETE FROM cloud_retention_jobs WHERE organisation_id=$1")
             .bind(org_id)
             .execute(&pool)
@@ -2023,10 +2284,13 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     assert_eq!(run.processed_items, 5);
     assert_eq!(run.held_items, 0);
     assert!(matches!(
-        retention::enable_purge(&pool, &dry_run_job_id).await,
-        Err(retention::RetentionError::Held(
-            "purge prerequisites are not met"
-        ))
+        retention::run_once(
+            &pool,
+            "unapproved-purge-worker",
+            retention::RetentionMode::Purge
+        )
+        .await,
+        Err(retention::RetentionError::Held(_))
     ));
     let purge_enabled: bool =
         sqlx::query_scalar("SELECT purge_enabled FROM cloud_retention_jobs WHERE job_id=$1")
@@ -2121,6 +2385,125 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     assert_eq!(cancelled_reason.as_deref(), Some("operator_cancelled"));
     assert_eq!(live_job_count, 0);
 
+    // Exercise the separately approved destructive path only after the non-destructive
+    // operator hold/cancel assertions above. The test uses a signed restore attestation and
+    // the exact dry-run scope fingerprint; an unapproved worker call cannot claim the job.
+    sqlx::query(
+        "UPDATE cloud_retention_jobs SET state='dry_run',dry_run=TRUE,purge_enabled=FALSE, \
+             dry_run_completed_at=COALESCE(dry_run_completed_at,now()), \
+             hold_code=NULL,execution_scope_generation=NULL, \
+             expected_scope_generation=(SELECT retention_generation FROM organizations WHERE id=$2), \
+             deadline_at=notice_evidence_at+interval '30 days' \
+         WHERE job_id=$1",
+    )
+    .bind(&dry_run_job_id)
+    .bind(&organisation_id)
+    .execute(&pool)
+    .await
+    .expect("prepare the completed dry run for its guarded purge review");
+    sqlx::query(
+        "UPDATE cloud_retention_scope_items SET state='dry_run',hold_code=NULL, \
+             expected_revision=CASE WHEN resource_kind='environment' THEN \
+                 (SELECT revision FROM environments WHERE id=resource_id) ELSE expected_revision END \
+         WHERE job_id=$1",
+    )
+    .bind(&dry_run_job_id)
+    .execute(&pool)
+    .await
+    .expect("refresh reviewed resource revisions after the test generation changes");
+    let release_sha = "a".repeat(40);
+    let evidence_key = b"test restore evidence key with at least thirty two bytes";
+    let journal_entry_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_tombstone_journal")
+            .fetch_one(&pool)
+            .await
+            .expect("count the current global tombstone journal");
+    let mut restore_evidence = retention::RestoreEvidenceAttestation {
+        evidence_id: format!("restore-evidence:shared-{suffix}"),
+        release_sha: release_sha.clone(),
+        backup_fingerprint: "b".repeat(64),
+        sidecar_sha256: "c".repeat(64),
+        journal_entry_count,
+        replay_entry_count: journal_entry_count,
+        first_replay_deleted_count: journal_entry_count,
+        second_replay_deleted_count: 0,
+        incarnation_guard_verified: true,
+        signature: String::new(),
+    };
+    restore_evidence.signature = retention::sign_restore_evidence(&restore_evidence, evidence_key);
+    retention::register_restore_evidence(
+        &pool,
+        &restore_evidence,
+        evidence_key,
+        &release_sha,
+        "retention-test",
+    )
+    .await
+    .expect("record independently signed restore evidence");
+    let reviewed_scope = retention::review_scope_fingerprint(&pool, &dry_run_job_id)
+        .await
+        .expect("fingerprint the complete scope for explicit review");
+    retention::approve_purge(
+        &pool,
+        &dry_run_job_id,
+        &reviewed_scope,
+        &restore_evidence.evidence_id,
+        "retention-reviewer",
+        &release_sha,
+    )
+    .await
+    .expect("approve only the reviewed scope with current restore evidence");
+    retention::apply_operator_action(
+        &pool,
+        &dry_run_job_id,
+        "retention-reviewer",
+        OperatorAction::Hold,
+    )
+    .await
+    .expect("operator hold revokes the active destructive approval");
+    let revoked_approval: String = sqlx::query_scalar(
+        "SELECT state FROM cloud_retention_purge_approvals WHERE job_id=$1 ORDER BY approved_at DESC LIMIT 1",
+    )
+    .bind(&dry_run_job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read revoked purge approval");
+    assert_eq!(revoked_approval, "revoked");
+    retention::approve_purge(
+        &pool,
+        &dry_run_job_id,
+        &reviewed_scope,
+        &restore_evidence.evidence_id,
+        "retention-reviewer",
+        &release_sha,
+    )
+    .await
+    .expect("resume a held purge only through a fresh explicit approval");
+    let purge =
+        retention::run_approved_purge_once(&pool, "approved-shared-retention-worker", &release_sha)
+            .await
+            .expect("run the separately approved bounded purge")
+            .expect("claim the approved due job");
+    assert_eq!(purge.state.as_str(), "completed");
+    let deletion_counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_retention_receipts WHERE job_id=$1), \
+                (SELECT count(*) FROM cloud_retention_tombstone_journal WHERE job_id=$1)",
+    )
+    .bind(&dry_run_job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verify atomic receipts and restore tombstones");
+    assert_eq!(deletion_counts, (held_scope_count, held_scope_count));
+    let protected_users_remain: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1) AND EXISTS(SELECT 1 FROM users WHERE id=$2)",
+    )
+    .bind(&owner_id)
+    .bind(&admin_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verify purging scoped data did not delete account rows");
+    assert!(protected_users_remain);
+
     app.cloud_shared_retention_dry_run_enabled = false;
     sqlx::query("DELETE FROM cloud_notice_outbox WHERE scope_id=$1")
         .bind(&organisation_id)
@@ -2135,6 +2518,22 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     .execute(&pool)
     .await
     .expect("remove shared operator actions");
+    sqlx::query(
+        "DELETE FROM cloud_retention_purge_approvals WHERE job_id IN \
+         (SELECT job_id FROM cloud_retention_jobs WHERE organisation_id=$1)",
+    )
+    .bind(&organisation_id)
+    .execute(&pool)
+    .await
+    .expect("remove shared purge approvals");
+    sqlx::query(
+        "DELETE FROM cloud_retention_receipts WHERE job_id IN \
+         (SELECT job_id FROM cloud_retention_jobs WHERE organisation_id=$1)",
+    )
+    .bind(&organisation_id)
+    .execute(&pool)
+    .await
+    .expect("remove shared purge receipts");
     sqlx::query("DELETE FROM cloud_retention_jobs WHERE organisation_id=$1")
         .bind(&organisation_id)
         .execute(&pool)

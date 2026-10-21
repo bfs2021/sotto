@@ -406,8 +406,33 @@ async fn snapshot_personal_scope(
     .bind((MAX_SCOPE_ITEMS + 1) as i64)
     .fetch_all(&mut **tx)
     .await?;
+    let grants = sqlx::query(
+        "SELECT g.env_id,g.user_id,(extract(epoch FROM g.created_at)*1000000)::bigint AS created_epoch, \
+                EXISTS (SELECT 1 FROM environment_grants other \
+                        WHERE other.env_id=g.env_id AND other.user_id<>p.owner_id) AS shared \
+         FROM environment_grants g JOIN environments e ON e.id=g.env_id \
+         JOIN projects p ON p.id=e.project_id WHERE p.owner_id=$1 AND p.org_id IS NULL \
+         ORDER BY g.env_id COLLATE \"C\",g.user_id COLLATE \"C\" LIMIT $2",
+    )
+    .bind(user_id)
+    .bind((MAX_SCOPE_ITEMS + 1) as i64)
+    .fetch_all(&mut **tx)
+    .await?;
+    let machine_tokens = sqlx::query(
+        "SELECT m.id,m.env_id,(extract(epoch FROM m.created_at)*1000000)::bigint AS created_epoch, \
+                EXISTS (SELECT 1 FROM environment_grants g WHERE g.env_id=m.env_id AND g.user_id<>p.owner_id) AS shared \
+         FROM machine_tokens m JOIN environments e ON e.id=m.env_id \
+         JOIN projects p ON p.id=e.project_id WHERE p.owner_id=$1 AND p.org_id IS NULL \
+         ORDER BY m.id COLLATE \"C\" LIMIT $2",
+    )
+    .bind(user_id)
+    .bind((MAX_SCOPE_ITEMS + 1) as i64)
+    .fetch_all(&mut **tx)
+    .await?;
 
-    let mut scope = Vec::with_capacity(projects.len() + environments.len() + shares.len());
+    let mut scope = Vec::with_capacity(
+        projects.len() + environments.len() + shares.len() + grants.len() + machine_tokens.len(),
+    );
     for row in projects {
         let id: String = row.try_get("id")?;
         let created: i64 = row.try_get("created_epoch")?;
@@ -467,6 +492,40 @@ async fn snapshot_personal_scope(
                 now_epoch,
                 deadline_epoch,
             ),
+        ));
+    }
+    for row in grants {
+        let env_id: String = row.try_get("env_id")?;
+        let user_id: String = row.try_get("user_id")?;
+        let created: i64 = row.try_get("created_epoch")?;
+        let shared: bool = row.try_get("shared")?;
+        scope.push((
+            ScopeItem {
+                job_id: job_id.to_owned(),
+                resource_kind: "grant".into(),
+                resource_id: serde_json::json!([env_id, user_id]).to_string(),
+                ownership_kind: if shared { "shared" } else { "personal" }.into(),
+                expected_created_at_epoch: created,
+                expected_revision: None,
+            },
+            shared.then_some("shared_resource"),
+        ));
+    }
+    for row in machine_tokens {
+        let token_id: String = row.try_get("id")?;
+        let env_id: String = row.try_get("env_id")?;
+        let created: i64 = row.try_get("created_epoch")?;
+        let shared: bool = row.try_get("shared")?;
+        scope.push((
+            ScopeItem {
+                job_id: job_id.to_owned(),
+                resource_kind: "machine_token".into(),
+                resource_id: serde_json::json!([token_id, env_id]).to_string(),
+                ownership_kind: if shared { "shared" } else { "personal" }.into(),
+                expected_created_at_epoch: created,
+                expected_revision: None,
+            },
+            shared.then_some("shared_resource"),
         ));
     }
     Ok(scope)
@@ -555,9 +614,12 @@ fn epoch_now() -> i64 {
         .map_or(0, |duration| duration.as_secs() as i64)
 }
 
-/// Start the default-off dry-run reconciler. It has no provider and no purge-mode call site.
+/// Start the default-off retention workers. Dry runs are non-destructive; purge uses a separate
+/// provider-independent entry point that requires a live approval and restore attestation.
 pub fn spawn(state: AppState) {
-    if (!state.cloud_retention_dry_run_enabled && !state.cloud_shared_retention_dry_run_enabled)
+    if (!state.cloud_retention_dry_run_enabled
+        && !state.cloud_shared_retention_dry_run_enabled
+        && !state.cloud_retention_purge_enabled)
         || state.deployment_mode != DeploymentMode::Cloud
     {
         return;
@@ -594,6 +656,24 @@ pub fn spawn(state: AppState) {
                         Ok(None) => break,
                         Err(_) => {
                             eprintln!("cloud shared retention dry run failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            if state.cloud_retention_purge_enabled {
+                for _ in 0..128 {
+                    let Some(release_sha) = state.cloud_retention_build_sha.as_deref() else {
+                        eprintln!("cloud retention purge release identity is unavailable");
+                        break;
+                    };
+                    match retention::run_approved_purge_once(&state.pool, &worker_id, release_sha)
+                        .await
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            eprintln!("cloud retention purge batch failed");
                             break;
                         }
                     }

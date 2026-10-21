@@ -260,6 +260,10 @@ async fn run() -> Result<()> {
         cloud_retention_dry_run_enabled: config.cloud_retention_dry_run_enabled,
         cloud_shared_retention_dry_run_enabled: config.cloud_shared_retention_dry_run_enabled,
         cloud_retention_operator_token: config.cloud_retention_operator_token.clone(),
+        cloud_retention_purge_enabled: config.cloud_retention_purge_enabled,
+        cloud_retention_destructive_token: config.cloud_retention_destructive_token.clone(),
+        cloud_retention_evidence_hmac_key: config.cloud_retention_evidence_hmac_key.clone(),
+        cloud_retention_build_sha: config.cloud_retention_build_sha.clone(),
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());

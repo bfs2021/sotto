@@ -3,8 +3,9 @@
 //! A retention job records who or which organisation is in scope, the eligibility episode that
 //! created it, the fixed deadline and the notice evidence that supports it.  Scope items are
 //! stored separately so a later dry run can be reviewed before any purge switch is enabled. The
-//! production lifecycle calls only the personal dry-run entry point; purge remains separate and
-//! dormant pending its own activation gates.
+//! production lifecycle calls the personal and shared dry-run entry points by default only when
+//! their switches are set. A separately configured purge worker still requires signed restore
+//! evidence and a fresh exact-scope approval before each destructive batch.
 //!
 //! Scope item identifiers are canonical database identifiers. Share-link tokens supplied by a
 //! producer are resolved to their internal `share_links.id` while the scope is inserted.
@@ -14,6 +15,9 @@ use std::fmt;
 
 use crate::cloud_coverage::{self, CoverageState, EXPORT_WINDOW_SECONDS};
 use crate::cloud_coverage_store::StoreError;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
@@ -23,8 +27,12 @@ const MAX_EPISODE: usize = 160;
 const MAX_NOTICE_KEY: usize = 160;
 const MAX_SCOPE_ITEMS: i64 = 4_096;
 const BATCH_SIZE: i64 = 64;
+const RETENTION_POLICY_VERSION: i32 = 1;
+const RETENTION_PURGE_LOCK_NAMESPACE: i32 = 731_044;
+const RETENTION_PURGE_LOCK_KEY: i32 = 1;
 
 type RetentionResult<T> = std::result::Result<T, RetentionError>;
+type RestoreEvidenceIdentityRow = (String, String, String, i64, i64, i64, i64, bool, String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeKind {
@@ -242,6 +250,111 @@ pub struct RetentionRun {
     pub held_items: usize,
 }
 
+/// Signed summary emitted only after a real scratch restore and two tombstone replays.
+/// Fingerprints are safe to retain; paths, database URLs and customer identifiers are excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreEvidenceAttestation {
+    pub evidence_id: String,
+    pub release_sha: String,
+    pub backup_fingerprint: String,
+    pub sidecar_sha256: String,
+    pub journal_entry_count: i64,
+    pub replay_entry_count: i64,
+    pub first_replay_deleted_count: i64,
+    pub second_replay_deleted_count: i64,
+    pub incarnation_guard_verified: bool,
+    pub signature: String,
+}
+
+impl RestoreEvidenceAttestation {
+    pub fn validate_and_verify(
+        &self,
+        expected_release_sha: &str,
+        hmac_key: &[u8],
+    ) -> RetentionResult<()> {
+        bounded(&self.evidence_id, 128, "restore evidence id")?;
+        if !self.evidence_id.starts_with("restore-evidence:")
+            || self.release_sha != expected_release_sha
+            || !is_lower_hex(&self.release_sha, &[40, 64])
+            || !is_lower_hex(&self.backup_fingerprint, &[64])
+            || !is_lower_hex(&self.sidecar_sha256, &[64])
+            || !is_lower_hex(&self.signature, &[64])
+            || self.journal_entry_count < 0
+            || self.replay_entry_count != self.journal_entry_count
+            || self.first_replay_deleted_count < 0
+            || self.second_replay_deleted_count != 0
+            || !self.incarnation_guard_verified
+            || hmac_key.len() < 32
+        {
+            return Err(RetentionError::Held(
+                "restore evidence is incomplete or stale",
+            ));
+        }
+        let mut mac = Hmac::<Sha256>::new_from_slice(hmac_key)
+            .map_err(|_| RetentionError::InvalidInput("restore evidence key"))?;
+        mac.update(restore_evidence_payload(self).as_bytes());
+        let signature = decode_lower_hex_32(&self.signature).ok_or(RetentionError::Held(
+            "restore evidence signature is invalid",
+        ))?;
+        mac.verify_slice(&signature)
+            .map_err(|_| RetentionError::Held("restore evidence signature is invalid"))
+    }
+}
+
+fn restore_evidence_payload(evidence: &RestoreEvidenceAttestation) -> String {
+    let fields = [
+        "sotto-cloud-retention-restore-v1".to_owned(),
+        evidence.evidence_id.clone(),
+        evidence.release_sha.clone(),
+        evidence.backup_fingerprint.clone(),
+        evidence.sidecar_sha256.clone(),
+        evidence.journal_entry_count.to_string(),
+        evidence.replay_entry_count.to_string(),
+        evidence.first_replay_deleted_count.to_string(),
+        evidence.second_replay_deleted_count.to_string(),
+        evidence.incarnation_guard_verified.to_string(),
+    ];
+    fields
+        .iter()
+        .map(|field| format!("{}:{field}", field.len()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Test and offline signer seam. Production only accepts signatures made with the separate
+/// restore-evidence key; it never manufactures attestations itself.
+pub fn sign_restore_evidence(evidence: &RestoreEvidenceAttestation, key: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key sizes");
+    mac.update(restore_evidence_payload(evidence).as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn is_lower_hex(value: &str, lengths: &[usize]) -> bool {
+    lengths.contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_lower_hex_32(value: &str) -> Option<[u8; 32]> {
+    if !is_lower_hex(value, &[64]) {
+        return None;
+    }
+    let mut output = [0_u8; 32];
+    for (index, output_byte) in output.iter_mut().enumerate() {
+        let chunk = &value.as_bytes()[index * 2..index * 2 + 2];
+        let high = (chunk[0] as char).to_digit(16)? as u8;
+        let low = (chunk[1] as char).to_digit(16)? as u8;
+        *output_byte = (high << 4) | low;
+    }
+    Some(output)
+}
+
 #[derive(Debug, Clone)]
 struct RetentionLease {
     job_id: String,
@@ -249,6 +362,7 @@ struct RetentionLease {
     subject_user_id: Option<String>,
     expected_coverage_revision: Option<i64>,
     expected_scope_generation: Option<i64>,
+    execution_scope_generation: Option<i64>,
     eligibility_loss_epoch: Option<i64>,
     organisation_id: Option<String>,
     dry_run: bool,
@@ -595,7 +709,7 @@ pub async fn apply_operator_action(
             "UPDATE cloud_retention_jobs SET state='held', hold_code='operator_hold', \
                      lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
                  WHERE job_id=$1 AND state IN ('planned','ready','dry_run','held','leased') \
-                   AND dry_run=TRUE AND purge_enabled=FALSE",
+                   AND ((dry_run=TRUE AND purge_enabled=FALSE) OR (dry_run=FALSE AND purge_enabled=TRUE))",
         )
         .bind(job_id)
         .execute(&mut *tx)
@@ -605,7 +719,7 @@ pub async fn apply_operator_action(
             "UPDATE cloud_retention_jobs SET state='cancelled', hold_code='operator_cancelled', \
                      lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
                  WHERE job_id=$1 AND state IN ('planned','ready','dry_run','held','leased') \
-                   AND dry_run=TRUE AND purge_enabled=FALSE",
+                   AND ((dry_run=TRUE AND purge_enabled=FALSE) OR (dry_run=FALSE AND purge_enabled=TRUE))",
         )
         .bind(job_id)
         .execute(&mut *tx)
@@ -641,6 +755,15 @@ pub async fn apply_operator_action(
     if affected != 1 {
         return Err(RetentionError::NotFound);
     }
+    if matches!(action, OperatorAction::Hold | OperatorAction::Cancel) {
+        sqlx::query(
+            "UPDATE cloud_retention_purge_approvals SET state='revoked',invalidated_at=now() \
+             WHERE job_id=$1 AND state='active'",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(
         "INSERT INTO cloud_retention_operator_actions(action_id, job_id, action, actor_label) \
          VALUES ($1,$2,$3,$4)",
@@ -655,30 +778,517 @@ pub async fn apply_operator_action(
     Ok(())
 }
 
-pub async fn enable_purge(pool: &PgPool, job_id: &str) -> RetentionResult<()> {
-    bounded(job_id, MAX_KEY, "job_id")?;
+/// Record an HMAC-authenticated report from the private current-candidate restore rehearsal.
+/// The supplied count must match the live append-only journal at registration time.
+pub async fn register_restore_evidence(
+    pool: &PgPool,
+    evidence: &RestoreEvidenceAttestation,
+    signing_key: &[u8],
+    expected_release_sha: &str,
+    operator: &str,
+) -> RetentionResult<bool> {
+    bounded(operator, 80, "operator")?;
+    evidence.validate_and_verify(expected_release_sha, signing_key)?;
     let mut tx = pool.begin().await?;
-    let affected = sqlx::query(
-        "UPDATE cloud_retention_jobs SET state='ready', purge_enabled=TRUE, dry_run=FALSE, updated_at=now() \
-         WHERE job_id=$1 AND scope_kind='personal' AND state='dry_run' AND dry_run_completed_at IS NOT NULL \
-           AND notice_evidence_at IS NOT NULL AND deadline_at <= now() AND hold_code IS NULL",
+    let journal_entries: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_tombstone_journal")
+            .fetch_one(&mut *tx)
+            .await?;
+    if journal_entries != evidence.journal_entry_count {
+        return Err(RetentionError::Held("restore evidence journal is stale"));
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO cloud_retention_restore_evidence \
+         (evidence_id,release_sha,backup_fingerprint,sidecar_sha256,journal_entry_count, \
+          replay_entry_count,first_replay_deleted_count,second_replay_deleted_count, \
+          incarnation_guard_verified,signature,recorded_by) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+         ON CONFLICT(evidence_id) DO NOTHING",
     )
-    .bind(job_id)
+    .bind(&evidence.evidence_id)
+    .bind(&evidence.release_sha)
+    .bind(&evidence.backup_fingerprint)
+    .bind(&evidence.sidecar_sha256)
+    .bind(evidence.journal_entry_count)
+    .bind(evidence.replay_entry_count)
+    .bind(evidence.first_replay_deleted_count)
+    .bind(evidence.second_replay_deleted_count)
+    .bind(evidence.incarnation_guard_verified)
+    .bind(&evidence.signature)
+    .bind(operator)
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    if affected != 1 {
+    if inserted == 0 {
+        let stored: Option<RestoreEvidenceIdentityRow> = sqlx::query_as(
+            "SELECT release_sha,backup_fingerprint,sidecar_sha256,journal_entry_count, \
+                 replay_entry_count,first_replay_deleted_count,second_replay_deleted_count, \
+                 incarnation_guard_verified,signature \
+                 FROM cloud_retention_restore_evidence WHERE evidence_id=$1 FOR UPDATE",
+        )
+        .bind(&evidence.evidence_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let expected = (
+            evidence.release_sha.clone(),
+            evidence.backup_fingerprint.clone(),
+            evidence.sidecar_sha256.clone(),
+            evidence.journal_entry_count,
+            evidence.replay_entry_count,
+            evidence.first_replay_deleted_count,
+            evidence.second_replay_deleted_count,
+            evidence.incarnation_guard_verified,
+            evidence.signature.clone(),
+        );
+        if stored != Some(expected) {
+            return Err(RetentionError::IdentityConflict);
+        }
+    }
+    tx.commit().await?;
+    Ok(inserted == 1)
+}
+
+/// Return a stable, redacted digest of the job contract and every resource identity. Item state
+/// is intentionally excluded so the same approval remains bound to the exact scope as batches
+/// progress; any identity, owner, deadline, notice or generation change alters the digest.
+pub async fn review_scope_fingerprint(pool: &PgPool, job_id: &str) -> RetentionResult<String> {
+    bounded(job_id, MAX_KEY, "job_id")?;
+    let mut tx = pool.begin().await?;
+    let fingerprint = review_scope_fingerprint_in_tx(&mut tx, job_id).await?;
+    tx.commit().await?;
+    Ok(fingerprint)
+}
+
+async fn review_scope_fingerprint_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: &str,
+) -> RetentionResult<String> {
+    let job = sqlx::query(
+        "SELECT job_id,scope_kind,scope_key,subject_user_id,organisation_id,eligibility_episode, \
+                extract(epoch FROM deadline_at)::bigint AS deadline_epoch,notice_event_key, \
+                extract(epoch FROM notice_evidence_at)::bigint AS notice_evidence_epoch, \
+                expected_coverage_revision,expected_scope_generation, \
+                extract(epoch FROM eligibility_loss_at)::bigint AS eligibility_loss_epoch \
+         FROM cloud_retention_jobs WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(RetentionError::NotFound)?;
+    let mut hasher = Sha256::new();
+    fingerprint_field(&mut hasher, &RETENTION_POLICY_VERSION.to_string());
+    for name in [
+        "job_id",
+        "scope_kind",
+        "scope_key",
+        "subject_user_id",
+        "organisation_id",
+        "eligibility_episode",
+        "deadline_epoch",
+        "notice_event_key",
+        "notice_evidence_epoch",
+        "expected_coverage_revision",
+        "expected_scope_generation",
+        "eligibility_loss_epoch",
+    ] {
+        fingerprint_field(&mut hasher, name);
+        let value: Option<String> = match name {
+            "job_id" => Some(job.try_get("job_id")?),
+            "scope_kind" => Some(job.try_get("scope_kind")?),
+            "scope_key" => Some(job.try_get("scope_key")?),
+            "subject_user_id" => job.try_get("subject_user_id")?,
+            "organisation_id" => job.try_get("organisation_id")?,
+            "eligibility_episode" => Some(job.try_get("eligibility_episode")?),
+            "deadline_epoch" => Some(job.try_get::<i64, _>("deadline_epoch")?.to_string()),
+            "notice_event_key" => Some(job.try_get("notice_event_key")?),
+            "notice_evidence_epoch" => job
+                .try_get::<Option<i64>, _>("notice_evidence_epoch")?
+                .map(|value| value.to_string()),
+            "expected_coverage_revision" => job
+                .try_get::<Option<i64>, _>("expected_coverage_revision")?
+                .map(|value| value.to_string()),
+            "expected_scope_generation" => job
+                .try_get::<Option<i64>, _>("expected_scope_generation")?
+                .map(|value| value.to_string()),
+            "eligibility_loss_epoch" => job
+                .try_get::<Option<i64>, _>("eligibility_loss_epoch")?
+                .map(|value| value.to_string()),
+            _ => unreachable!(),
+        };
+        fingerprint_field(&mut hasher, value.as_deref().unwrap_or("<null>"));
+    }
+    let items = sqlx::query(
+        "SELECT resource_kind,resource_id,ownership_kind,expected_created_at,expected_revision \
+         FROM cloud_retention_scope_items WHERE job_id=$1 \
+         ORDER BY resource_kind COLLATE \"C\",resource_id COLLATE \"C\" LIMIT $2",
+    )
+    .bind(job_id)
+    .bind(MAX_SCOPE_ITEMS + 1)
+    .fetch_all(&mut **tx)
+    .await?;
+    if items.is_empty() || items.len() as i64 > MAX_SCOPE_ITEMS {
+        return Err(RetentionError::Held(
+            "retention scope is empty or exceeds its bound",
+        ));
+    }
+    fingerprint_field(&mut hasher, &items.len().to_string());
+    for item in items {
+        fingerprint_field(&mut hasher, &item.try_get::<String, _>("resource_kind")?);
+        fingerprint_field(&mut hasher, &item.try_get::<String, _>("resource_id")?);
+        fingerprint_field(&mut hasher, &item.try_get::<String, _>("ownership_kind")?);
+        fingerprint_field(
+            &mut hasher,
+            &item.try_get::<i64, _>("expected_created_at")?.to_string(),
+        );
+        let revision: Option<i64> = item.try_get("expected_revision")?;
+        fingerprint_field(
+            &mut hasher,
+            &revision.map_or_else(|| "<null>".into(), |v| v.to_string()),
+        );
+    }
+    Ok(hex_digest(&hasher.finalize()))
+}
+
+fn fingerprint_field(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hex_digest(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Approve one exact completed dry-run after checking current authority, notices, inventory and
+/// restore evidence. The separate protected route supplies the release identity and HMAC key.
+pub async fn approve_purge(
+    pool: &PgPool,
+    job_id: &str,
+    requested_scope_fingerprint: &str,
+    evidence_id: &str,
+    operator: &str,
+    expected_release_sha: &str,
+) -> RetentionResult<String> {
+    bounded(job_id, MAX_KEY, "job_id")?;
+    bounded(evidence_id, 128, "restore evidence id")?;
+    bounded(operator, 80, "operator")?;
+    if !is_lower_hex(requested_scope_fingerprint, &[64]) {
+        return Err(RetentionError::InvalidInput("scope fingerprint"));
+    }
+    let mut tx = pool.begin().await?;
+    let scope_kind: Option<String> =
+        sqlx::query_scalar("SELECT scope_kind FROM cloud_retention_jobs WHERE job_id=$1")
+            .bind(job_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match scope_kind.as_deref() {
+        Some("personal") => {
+            let subject: Option<String> = sqlx::query_scalar(
+                "SELECT subject_user_id FROM cloud_retention_jobs WHERE job_id=$1",
+            )
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if let Some(subject) = subject.as_deref() {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT beneficiary_id FROM cloud_coverage_coordinators WHERE beneficiary_id=$1 FOR SHARE",
+                )
+                .bind(subject)
+                .fetch_optional(&mut *tx)
+                .await?;
+                sqlx::query_scalar::<_, Option<i64>>(
+                    "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1 FOR SHARE",
+                )
+                .bind(subject)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let preview = load_retention_lease(&mut tx, job_id, "purge-review").await?;
+                lock_matching_notice(&mut tx, &preview, subject).await?;
+                sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+                    .bind(subject)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            }
+        }
+        Some("shared_organisation") => {
+            let preview = load_retention_lease(&mut tx, job_id, "purge-review").await?;
+            lock_shared_scope_rows(&mut tx, &preview).await?;
+        }
+        _ => {
+            return Err(RetentionError::Held(
+                "this retention scope cannot be purged",
+            ))
+        }
+    }
+    let lease = load_retention_lease(&mut tx, job_id, "purge-review").await?;
+    let job = sqlx::query(
+        "SELECT state,dry_run,purge_enabled,hold_code, \
+                dry_run_completed_at IS NOT NULL AS dry_run_complete,deadline_at <= now() AS deadline_passed, \
+                notice_evidence_at IS NOT NULL AS notice_evidence_present \
+         FROM cloud_retention_jobs WHERE job_id=$1 FOR UPDATE",
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let state: String = job.try_get("state")?;
+    let dry_run: bool = job.try_get("dry_run")?;
+    let purge_enabled: bool = job.try_get("purge_enabled")?;
+    let hold_code: Option<String> = job.try_get("hold_code")?;
+    let dry_run_complete: bool = job.try_get("dry_run_complete")?;
+    let deadline_passed: bool = job.try_get("deadline_passed")?;
+    let notice_evidence_present: bool = job.try_get("notice_evidence_present")?;
+    if !((state == "dry_run" && dry_run && !purge_enabled && hold_code.is_none())
+        || (state == "held"
+            && !dry_run
+            && purge_enabled
+            && matches!(
+                hold_code.as_deref(),
+                Some("restore_evidence_stale" | "operator_hold")
+            )))
+        || !dry_run_complete
+        || !deadline_passed
+        || !notice_evidence_present
+    {
         return Err(RetentionError::Held("purge prerequisites are not met"));
     }
+    let evidence = sqlx::query(
+        "SELECT release_sha,journal_entry_count FROM cloud_retention_restore_evidence \
+         WHERE evidence_id=$1 FOR SHARE",
+    )
+    .bind(evidence_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(RetentionError::Held("restore evidence is missing"))?;
+    let release_sha: String = evidence.try_get("release_sha")?;
+    let evidence_journal_count: i64 = evidence.try_get("journal_entry_count")?;
+    let current_journal_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_tombstone_journal")
+            .fetch_one(&mut *tx)
+            .await?;
+    if release_sha != expected_release_sha || evidence_journal_count != current_journal_count {
+        return Err(RetentionError::Held("restore evidence is stale"));
+    }
+    let item_counts: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),count(*) FILTER (WHERE state IN ('dry_run','deleted')) \
+         FROM cloud_retention_scope_items WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if item_counts.0 <= 0 || item_counts.0 > MAX_SCOPE_ITEMS || item_counts.0 != item_counts.1 {
+        return Err(RetentionError::Held("dry-run scope is incomplete"));
+    }
+    if lease.scope_kind == ScopeKind::Personal.as_str() {
+        let subject = lease
+            .subject_user_id
+            .as_deref()
+            .ok_or(RetentionError::Held("retention owner is missing"))?;
+        let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+            .fetch_one(&mut *tx)
+            .await?;
+        let authority = match crate::cloud_coverage_authority::load_current_in_transaction(
+            &mut tx, subject, now,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(crate::cloud_coverage_authority::AuthorityError::Database(error))
+            | Err(crate::cloud_coverage_authority::AuthorityError::Store(StoreError::Database(
+                error,
+            ))) => {
+                return Err(RetentionError::Database(error));
+            }
+            Err(_) => crate::cloud_coverage_authority::AuthorityState::Stale,
+        };
+        let coverage_revision: Option<i64> = sqlx::query_scalar(
+            "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1",
+        )
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let owner_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)")
+                .bind(subject)
+                .fetch_one(&mut *tx)
+                .await?;
+        let notice_available = lock_matching_notice(&mut tx, &lease, subject).await?;
+        if let Some(reason) = validate_dry_run_evidence(
+            &mut tx,
+            &lease,
+            Some(authority),
+            coverage_revision,
+            notice_available,
+            owner_exists,
+        )
+        .await?
+        {
+            return Err(RetentionError::Held(reason));
+        }
+        if let Some(reason) = validate_scope_inventory(&mut tx, &lease).await? {
+            return Err(RetentionError::Held(reason));
+        }
+    } else {
+        if let Some(reason) =
+            validate_shared_dry_run(&mut tx, &lease, lease.execution_scope_generation).await?
+        {
+            return Err(RetentionError::Held(reason));
+        }
+    }
+    let scope_fingerprint = review_scope_fingerprint_in_tx(&mut tx, job_id).await?;
+    if scope_fingerprint != requested_scope_fingerprint {
+        return Err(RetentionError::Held("reviewed scope changed"));
+    }
     sqlx::query(
-        "UPDATE cloud_retention_scope_items SET state='planned',updated_at=now() \
-         WHERE job_id=$1 AND state='dry_run'",
+        "UPDATE cloud_retention_purge_approvals SET state='stale',invalidated_at=now() \
+         WHERE job_id=$1 AND state='active'",
     )
     .bind(job_id)
     .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "INSERT INTO cloud_retention_purge_approvals \
+         (approval_id,job_id,scope_fingerprint,policy_version,evidence_id,journal_entry_count,actor_label) \
+         VALUES($1,$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(format!("retention-approval:{}", Uuid::new_v4()))
+    .bind(job_id)
+    .bind(&scope_fingerprint)
+    .bind(RETENTION_POLICY_VERSION)
+    .bind(evidence_id)
+    .bind(evidence_journal_count)
+    .bind(operator)
+    .execute(&mut *tx)
+    .await?;
+    let execution_generation = if lease.scope_kind == ScopeKind::SharedOrganisation.as_str() {
+        let org_id = lease
+            .organisation_id
+            .as_deref()
+            .ok_or(RetentionError::Held("organisation scope is missing"))?;
+        Some(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT retention_generation FROM organizations WHERE id=$1",
+            )
+            .bind(org_id)
+            .fetch_one(&mut *tx)
+            .await?,
+        )
+    } else {
+        None
+    };
+    sqlx::query(
+        "UPDATE cloud_retention_jobs SET state='ready',dry_run=FALSE,purge_enabled=TRUE, \
+                hold_code=NULL,execution_scope_generation=COALESCE($2,expected_scope_generation), \
+                updated_at=now() WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .bind(execution_generation)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(scope_fingerprint)
+}
+
+async fn load_retention_lease(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: &str,
+    worker_id: &str,
+) -> RetentionResult<RetentionLease> {
+    let row = sqlx::query(
+        "SELECT scope_kind,subject_user_id,expected_coverage_revision,expected_scope_generation,execution_scope_generation, \
+                extract(epoch FROM eligibility_loss_at)::bigint AS eligibility_loss_epoch, \
+                organisation_id,dry_run,extract(epoch FROM deadline_at)::bigint AS deadline_epoch, \
+                notice_event_key,extract(epoch FROM notice_evidence_at)::bigint AS notice_evidence_epoch \
+         FROM cloud_retention_jobs WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(RetentionError::NotFound)?;
+    Ok(RetentionLease {
+        job_id: job_id.to_owned(),
+        scope_kind: row.try_get("scope_kind")?,
+        subject_user_id: row.try_get("subject_user_id")?,
+        expected_coverage_revision: row.try_get("expected_coverage_revision")?,
+        expected_scope_generation: row.try_get("expected_scope_generation")?,
+        execution_scope_generation: row.try_get("execution_scope_generation")?,
+        eligibility_loss_epoch: row.try_get("eligibility_loss_epoch")?,
+        organisation_id: row.try_get("organisation_id")?,
+        dry_run: row.try_get("dry_run")?,
+        deadline_epoch: row.try_get("deadline_epoch")?,
+        notice_event_key: row.try_get("notice_event_key")?,
+        notice_evidence_epoch: row.try_get("notice_evidence_epoch")?,
+        worker_id: worker_id.to_owned(),
+    })
+}
+
+async fn validate_purge_approval(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &RetentionLease,
+    expected_release_sha: &str,
+) -> RetentionResult<Option<&'static str>> {
+    if !matches!(
+        lease.scope_kind.as_str(),
+        "personal" | "shared_organisation"
+    ) {
+        return Ok(Some("unsupported_scope"));
+    }
+    let approval = sqlx::query(
+        "SELECT approval.approval_id,approval.scope_fingerprint,approval.policy_version, \
+                approval.evidence_id,approval.journal_entry_count,evidence.release_sha, \
+                evidence.journal_entry_count AS evidence_journal_count \
+         FROM cloud_retention_purge_approvals approval \
+         JOIN cloud_retention_restore_evidence evidence USING(evidence_id) \
+         WHERE approval.job_id=$1 AND approval.state='active' FOR UPDATE OF approval",
+    )
+    .bind(&lease.job_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(approval) = approval else {
+        return Ok(Some("purge_approval_missing"));
+    };
+    let approval_id: String = approval.try_get("approval_id")?;
+    let scope_fingerprint: String = approval.try_get("scope_fingerprint")?;
+    let policy_version: i32 = approval.try_get("policy_version")?;
+    let evidence_release_sha: String = approval.try_get("release_sha")?;
+    let approval_journal_count: i64 = approval.try_get("journal_entry_count")?;
+    let evidence_journal_count: i64 = approval.try_get("evidence_journal_count")?;
+    let current_journal_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_tombstone_journal")
+            .fetch_one(&mut **tx)
+            .await?;
+    let current_scope_fingerprint = review_scope_fingerprint_in_tx(tx, &lease.job_id).await?;
+    let item_counts: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),count(*) FILTER (WHERE state IN ('dry_run','deleted')) \
+         FROM cloud_retention_scope_items WHERE job_id=$1",
+    )
+    .bind(&lease.job_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let reason = if policy_version != RETENTION_POLICY_VERSION
+        || scope_fingerprint != current_scope_fingerprint
+        || item_counts.0 <= 0
+        || item_counts.0 != item_counts.1
+    {
+        Some("scope_changed")
+    } else if evidence_release_sha != expected_release_sha
+        || approval_journal_count != evidence_journal_count
+        || approval_journal_count != current_journal_count
+    {
+        Some("restore_evidence_stale")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        sqlx::query(
+            "UPDATE cloud_retention_purge_approvals SET state='stale',invalidated_at=now() \
+             WHERE approval_id=$1 AND state='active'",
+        )
+        .bind(approval_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(Some(reason));
+    }
+    Ok(None)
 }
 
 pub async fn list_scope(pool: &PgPool, job_id: &str) -> RetentionResult<Vec<ScopeItem>> {
@@ -726,7 +1336,10 @@ async fn claim_due(
     let row = sqlx::query(
         "SELECT job_id FROM cloud_retention_jobs \
          WHERE deadline_at <= now() AND ($2=FALSE OR scope_kind='personal') \
-           AND ($3=FALSE OR scope_kind='shared_organisation') AND \
+           AND ($3=FALSE OR scope_kind='shared_organisation') \
+           AND ($1 <> 'purge' OR (scope_kind IN ('personal','shared_organisation') \
+                AND EXISTS (SELECT 1 FROM cloud_retention_purge_approvals approval \
+                    WHERE approval.job_id=cloud_retention_jobs.job_id AND approval.state='active'))) AND \
            (($1 = 'dry_run' AND state='ready' AND dry_run=TRUE) OR \
             (state = 'ready' AND dry_run = FALSE AND purge_enabled = TRUE AND $1 = 'purge') OR \
             (state = 'leased' AND lease_expires_at <= now() AND \
@@ -748,13 +1361,16 @@ async fn claim_due(
         "UPDATE cloud_retention_jobs SET state='leased', lease_owner=$1, \
              lease_expires_at=now()+interval '5 minutes', attempt_count=attempt_count+1, updated_at=now() \
         WHERE job_id=$2 AND ($4=FALSE OR scope_kind='personal') \
-           AND ($5=FALSE OR scope_kind='shared_organisation') AND \
+           AND ($5=FALSE OR scope_kind='shared_organisation') \
+           AND ($3 <> 'purge' OR (scope_kind IN ('personal','shared_organisation') \
+                AND EXISTS (SELECT 1 FROM cloud_retention_purge_approvals approval \
+                    WHERE approval.job_id=cloud_retention_jobs.job_id AND approval.state='active'))) AND \
            (($3 = 'dry_run' AND state='ready' AND dry_run=TRUE) OR \
             ($3 = 'purge' AND state='ready' AND dry_run=FALSE AND purge_enabled=TRUE) OR \
             (state='leased' AND lease_expires_at <= now() AND \
              (($3 = 'dry_run' AND dry_run=TRUE) OR \
               ($3 = 'purge' AND dry_run=FALSE AND purge_enabled=TRUE)))) \
-         RETURNING scope_kind, subject_user_id, organisation_id, expected_coverage_revision, expected_scope_generation, \
+         RETURNING scope_kind, subject_user_id, organisation_id, expected_coverage_revision, expected_scope_generation, execution_scope_generation, \
                    extract(epoch FROM eligibility_loss_at)::bigint AS eligibility_loss_epoch, dry_run, \
                    extract(epoch from deadline_at)::bigint AS deadline_epoch, \
                    notice_event_key, extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch",
@@ -773,6 +1389,7 @@ async fn claim_due(
         organisation_id: row.try_get("organisation_id")?,
         expected_coverage_revision: row.try_get("expected_coverage_revision")?,
         expected_scope_generation: row.try_get("expected_scope_generation")?,
+        execution_scope_generation: row.try_get("execution_scope_generation")?,
         eligibility_loss_epoch: row.try_get("eligibility_loss_epoch")?,
         dry_run: row.try_get("dry_run")?,
         deadline_epoch: row.try_get("deadline_epoch")?,
@@ -784,15 +1401,40 @@ async fn claim_due(
     Ok(Some(lease))
 }
 
-/// Run one bounded dry-run or purge batch.  The purge mode is unreachable until the durable job
-/// has an explicit switch, a notice timestamp and a passed deadline; a caller cannot turn a dry
-/// run into deletion by changing only the process argument.
+/// Run the bounded non-destructive mode. Purge is deliberately rejected here so ordinary worker
+/// call sites cannot turn a dry run into deletion by changing only a mode argument.
 pub async fn run_once(
     pool: &PgPool,
     worker_id: &str,
     mode: RetentionMode,
 ) -> RetentionResult<Option<RetentionRun>> {
-    run_once_with_scope(pool, worker_id, mode, false, false).await
+    if mode == RetentionMode::Purge {
+        return Err(RetentionError::Held(
+            "purge execution requires the configured approved-retention worker",
+        ));
+    }
+    run_once_with_scope(pool, worker_id, mode, false, false, None).await
+}
+
+/// Production purge seam. It is called only by the separately configured worker, and each batch
+/// still requires a live approval plus matching restore evidence in the database.
+pub async fn run_approved_purge_once(
+    pool: &PgPool,
+    worker_id: &str,
+    expected_release_sha: &str,
+) -> RetentionResult<Option<RetentionRun>> {
+    if !is_lower_hex(expected_release_sha, &[40, 64]) {
+        return Err(RetentionError::InvalidInput("release sha"));
+    }
+    run_once_with_scope(
+        pool,
+        worker_id,
+        RetentionMode::Purge,
+        false,
+        false,
+        Some(expected_release_sha),
+    )
+    .await
 }
 
 /// Production entry point: it can only claim personal dry-run jobs. The mode and scope are fixed
@@ -801,7 +1443,7 @@ pub async fn run_dry_run_once(
     pool: &PgPool,
     worker_id: &str,
 ) -> RetentionResult<Option<RetentionRun>> {
-    run_once_with_scope(pool, worker_id, RetentionMode::DryRun, true, false).await
+    run_once_with_scope(pool, worker_id, RetentionMode::DryRun, true, false, None).await
 }
 
 /// Run one non-destructive dry-run batch for a qualified shared organisation scope.
@@ -810,7 +1452,7 @@ pub async fn run_shared_dry_run_once(
     pool: &PgPool,
     worker_id: &str,
 ) -> RetentionResult<Option<RetentionRun>> {
-    run_once_with_scope(pool, worker_id, RetentionMode::DryRun, false, true).await
+    run_once_with_scope(pool, worker_id, RetentionMode::DryRun, false, true, None).await
 }
 
 async fn run_once_with_scope(
@@ -819,15 +1461,28 @@ async fn run_once_with_scope(
     mode: RetentionMode,
     personal_only: bool,
     shared_only: bool,
+    expected_release_sha: Option<&str>,
 ) -> RetentionResult<Option<RetentionRun>> {
     let Some(lease) = claim_due(pool, worker_id, mode, personal_only, shared_only).await? else {
         return Ok(None);
     };
     let mut tx = pool.begin().await?;
+    if mode == RetentionMode::Purge {
+        // Restore evidence binds the global tombstone journal count. Serialize destructive
+        // batches across jobs so two workers cannot both validate the same journal generation
+        // and then append tombstones concurrently under that one attestation.
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(RETENTION_PURGE_LOCK_NAMESPACE)
+            .bind(RETENTION_PURGE_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+    }
     // Collection completion locks the coordinator before publishing the coverage head. Keep
     // that order here, then retain the existing head-before-job order used by candidate
     // reconciliation.
-    if mode == RetentionMode::DryRun && personal_only {
+    if matches!(mode, RetentionMode::DryRun | RetentionMode::Purge)
+        && lease.scope_kind == ScopeKind::Personal.as_str()
+    {
         if let Some(subject) = lease.subject_user_id.as_deref() {
             sqlx::query_scalar::<_, String>(
                 "SELECT beneficiary_id FROM cloud_coverage_coordinators WHERE beneficiary_id=$1 FOR SHARE",
@@ -837,7 +1492,9 @@ async fn run_once_with_scope(
             .await?;
         }
     }
-    let locked_coverage_revision = if mode == RetentionMode::DryRun && personal_only {
+    let locked_coverage_revision = if matches!(mode, RetentionMode::DryRun | RetentionMode::Purge)
+        && lease.scope_kind == ScopeKind::Personal.as_str()
+    {
         match lease.subject_user_id.as_deref() {
             Some(subject) => sqlx::query_scalar::<_, Option<i64>>(
                 "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1 FOR SHARE",
@@ -851,31 +1508,36 @@ async fn run_once_with_scope(
     } else {
         None
     };
-    if mode == RetentionMode::DryRun && lease.scope_kind == ScopeKind::SharedOrganisation.as_str() {
+    if matches!(mode, RetentionMode::DryRun | RetentionMode::Purge)
+        && lease.scope_kind == ScopeKind::SharedOrganisation.as_str()
+    {
         lock_shared_scope_rows(&mut tx, &lease).await?;
     }
     // Keep the candidate writer's lock order: coverage head, exact notice, owner, then job. The
     // owner lock prevents new personal resources appearing between the inventory check and the
     // dry-run result, while the notice lock prevents cancellation after evidence was checked.
-    let (notice_available, owner_exists) = if mode == RetentionMode::DryRun && personal_only {
-        let notice_available = match lease.subject_user_id.as_deref() {
-            Some(subject) => lock_matching_notice(&mut tx, &lease, subject).await?,
-            None => false,
+    let (notice_available, owner_exists) =
+        if matches!(mode, RetentionMode::DryRun | RetentionMode::Purge)
+            && lease.scope_kind == ScopeKind::Personal.as_str()
+        {
+            let notice_available = match lease.subject_user_id.as_deref() {
+                Some(subject) => lock_matching_notice(&mut tx, &lease, subject).await?,
+                None => false,
+            };
+            let owner_exists = match lease.subject_user_id.as_deref() {
+                Some(subject) => {
+                    sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+                        .bind(subject)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .is_some()
+                }
+                None => false,
+            };
+            (notice_available, owner_exists)
+        } else {
+            (false, false)
         };
-        let owner_exists = match lease.subject_user_id.as_deref() {
-            Some(subject) => {
-                sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE id=$1 FOR UPDATE")
-                    .bind(subject)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .is_some()
-            }
-            None => false,
-        };
-        (notice_available, owner_exists)
-    } else {
-        (false, false)
-    };
     let lease_state = sqlx::query(
         "SELECT state, lease_owner FROM cloud_retention_jobs WHERE job_id=$1 FOR UPDATE",
     )
@@ -900,7 +1562,25 @@ async fn run_once_with_scope(
     if state != RetentionState::Leased.as_str() || owner.as_deref() != Some(&lease.worker_id) {
         return Err(RetentionError::LeaseLost);
     }
-    if mode == RetentionMode::DryRun && personal_only {
+    if mode == RetentionMode::Purge {
+        let Some(release_sha) = expected_release_sha else {
+            return Err(RetentionError::Held("purge release identity is missing"));
+        };
+        if let Some(reason) = validate_purge_approval(&mut tx, &lease, release_sha).await? {
+            set_job_hold(&mut tx, &lease, reason).await?;
+            tx.commit().await?;
+            return Ok(Some(RetentionRun {
+                job_id: lease.job_id,
+                state: RetentionState::Held,
+                dry_run: false,
+                processed_items: 0,
+                held_items: 0,
+            }));
+        }
+    }
+    if matches!(mode, RetentionMode::DryRun | RetentionMode::Purge)
+        && lease.scope_kind == ScopeKind::Personal.as_str()
+    {
         let authority_snapshot = match lease.subject_user_id.as_deref() {
             Some(subject) => {
                 let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
@@ -938,7 +1618,7 @@ async fn run_once_with_scope(
             return Ok(Some(RetentionRun {
                 job_id: lease.job_id,
                 state: RetentionState::Held,
-                dry_run: true,
+                dry_run: lease.dry_run,
                 processed_items: 0,
                 held_items: 0,
             }));
@@ -949,42 +1629,75 @@ async fn run_once_with_scope(
             return Ok(Some(RetentionRun {
                 job_id: lease.job_id,
                 state: RetentionState::Held,
-                dry_run: true,
+                dry_run: lease.dry_run,
                 processed_items: 0,
                 held_items: 0,
             }));
         }
-    } else if let Some(expected) = lease.expected_coverage_revision {
-        let current: Option<i64> = sqlx::query_scalar(
-            "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1",
-        )
-        .bind(lease.subject_user_id.as_deref())
-        .fetch_optional(&mut *tx)
-        .await?;
-        if current != Some(expected) {
-            set_job_hold(&mut tx, &lease, "coverage_revision_changed").await?;
+    } else if mode == RetentionMode::DryRun {
+        if let Some(expected) = lease.expected_coverage_revision {
+            let current: Option<i64> = sqlx::query_scalar(
+                "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1",
+            )
+            .bind(lease.subject_user_id.as_deref())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if current != Some(expected) {
+                set_job_hold(&mut tx, &lease, "coverage_revision_changed").await?;
+                tx.commit().await?;
+                return Ok(Some(RetentionRun {
+                    job_id: lease.job_id,
+                    state: RetentionState::Held,
+                    dry_run: lease.dry_run,
+                    processed_items: 0,
+                    held_items: 0,
+                }));
+            }
+        }
+    }
+
+    if mode == RetentionMode::Purge && lease.scope_kind == ScopeKind::SharedOrganisation.as_str() {
+        if let Some(reason) =
+            validate_shared_dry_run(&mut tx, &lease, lease.execution_scope_generation).await?
+        {
+            sqlx::query(
+                "UPDATE cloud_retention_purge_approvals SET state='stale',invalidated_at=now() \
+                 WHERE job_id=$1 AND state='active'",
+            )
+            .bind(&lease.job_id)
+            .execute(&mut *tx)
+            .await?;
+            set_job_hold(&mut tx, &lease, reason).await?;
             tx.commit().await?;
             return Ok(Some(RetentionRun {
                 job_id: lease.job_id,
                 state: RetentionState::Held,
-                dry_run: lease.dry_run,
+                dry_run: false,
                 processed_items: 0,
                 held_items: 0,
             }));
         }
     }
 
+    let item_state = if mode == RetentionMode::DryRun {
+        "planned"
+    } else {
+        "dry_run"
+    };
     let items = sqlx::query(
         "SELECT resource_kind, resource_id, ownership_kind, expected_created_at, expected_revision \
-         FROM cloud_retention_scope_items WHERE job_id=$1 AND state='planned' \
-         ORDER BY resource_kind, resource_id LIMIT $2 FOR UPDATE",
+         FROM cloud_retention_scope_items WHERE job_id=$1 AND state=$2 \
+         ORDER BY CASE resource_kind WHEN 'grant' THEN 0 WHEN 'machine_token' THEN 1 \
+                  WHEN 'environment' THEN 2 WHEN 'share' THEN 3 WHEN 'project' THEN 4 ELSE 5 END, \
+                  resource_kind COLLATE \"C\",resource_id COLLATE \"C\" LIMIT $3 FOR UPDATE",
     )
     .bind(&lease.job_id)
+    .bind(item_state)
     .bind(BATCH_SIZE)
     .fetch_all(&mut *tx)
     .await?;
     if mode == RetentionMode::DryRun && lease.scope_kind == ScopeKind::SharedOrganisation.as_str() {
-        if let Some(reason) = validate_shared_dry_run(&mut tx, &lease).await? {
+        if let Some(reason) = validate_shared_dry_run(&mut tx, &lease, None).await? {
             set_job_hold(&mut tx, &lease, reason).await?;
             sqlx::query(
                 "UPDATE cloud_retention_scope_items SET state='held',hold_code=$2,updated_at=now() \
@@ -1149,10 +1862,17 @@ async fn run_once_with_scope(
         }));
     }
 
-    let subject = lease
-        .subject_user_id
-        .as_deref()
-        .ok_or(RetentionError::Held("shared scope is not deletable"))?;
+    let owner_id = match lease.scope_kind.as_str() {
+        "personal" => lease.subject_user_id.as_deref(),
+        "shared_organisation" => lease.organisation_id.as_deref(),
+        _ => None,
+    }
+    .ok_or(RetentionError::Held("retention scope owner is missing"))?;
+    let expected_ownership = if lease.scope_kind == ScopeKind::Personal.as_str() {
+        "personal"
+    } else {
+        "shared"
+    };
     let mut processed = 0;
     let mut held = 0;
     let mut hold_reason = None;
@@ -1162,7 +1882,7 @@ async fn run_once_with_scope(
         let ownership_kind: String = item.try_get("ownership_kind")?;
         let expected_created_at_epoch: i64 = item.try_get("expected_created_at")?;
         let expected_revision: Option<i64> = item.try_get("expected_revision")?;
-        if lease.scope_kind != ScopeKind::Personal.as_str() || ownership_kind != "personal" {
+        if ownership_kind != expected_ownership {
             sqlx::query(
                 "UPDATE cloud_retention_scope_items SET state='held', hold_code='shared_resource', updated_at=now() \
                  WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
@@ -1176,131 +1896,35 @@ async fn run_once_with_scope(
             hold_reason = Some("shared_resource");
             continue;
         }
-        let deleted = match resource_kind.as_str() {
-            "project" => {
-                let current = sqlx::query(
-                    "SELECT owner_id, org_id, (extract(epoch from created_at) * 1000000)::bigint AS created_epoch \
-                     FROM projects WHERE id=$1 FOR UPDATE",
-                )
-                    .bind(&resource_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                match current {
-                    None => 0,
-                    Some(current) => {
-                        let owner_id: String = current.try_get("owner_id")?;
-                        let org_id: Option<String> = current.try_get("org_id")?;
-                        let created_epoch: i64 = current.try_get("created_epoch")?;
-                        if owner_id != subject
-                            || org_id.is_some()
-                            || created_epoch != expected_created_at_epoch
-                        {
-                            sqlx::query(
-                            "UPDATE cloud_retention_scope_items SET state='held', hold_code='resource_identity_changed', updated_at=now() \
-                             WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
-                        )
-                        .bind(&lease.job_id)
-                        .bind(&resource_kind)
-                        .bind(&resource_id)
-                        .execute(&mut *tx)
-                        .await?;
-                            held += 1;
-                            hold_reason = Some("resource_identity_changed");
-                            continue;
-                        }
-                        sqlx::query("DELETE FROM projects WHERE id=$1")
-                            .bind(&resource_id)
-                            .execute(&mut *tx)
-                            .await?
-                            .rows_affected()
-                    }
-                }
-            }
-            "environment" => {
-                let current = sqlx::query(
-                    "SELECT e.revision, p.owner_id, p.org_id, \
-                            (extract(epoch from e.created_at) * 1000000)::bigint AS created_epoch \
-                     FROM environments e JOIN projects p ON p.id=e.project_id \
-                     WHERE e.id=$1 FOR UPDATE",
-                )
-                .bind(&resource_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-                match current {
-                    None => 0,
-                    Some(current) => {
-                        let revision: i64 = current.try_get("revision")?;
-                        let owner_id: String = current.try_get("owner_id")?;
-                        let org_id: Option<String> = current.try_get("org_id")?;
-                        let created_epoch: i64 = current.try_get("created_epoch")?;
-                        if owner_id != subject
-                            || org_id.is_some()
-                            || expected_revision.is_some_and(|expected| expected != revision)
-                            || created_epoch != expected_created_at_epoch
-                        {
-                            sqlx::query(
-                            "UPDATE cloud_retention_scope_items SET state='held', hold_code='resource_identity_changed', updated_at=now() \
-                             WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
-                        )
-                        .bind(&lease.job_id)
-                        .bind(&resource_kind)
-                        .bind(&resource_id)
-                        .execute(&mut *tx)
-                            .await?;
-                            held += 1;
-                            hold_reason = Some("resource_identity_changed");
-                            continue;
-                        }
-                        sqlx::query("DELETE FROM environments WHERE id=$1")
-                            .bind(&resource_id)
-                            .execute(&mut *tx)
-                            .await?
-                            .rows_affected()
-                    }
-                }
-            }
-            "share" => {
-                let current = sqlx::query(
-                    "SELECT created_by, (extract(epoch from created_at) * 1000000)::bigint AS created_epoch \
-                     FROM share_links WHERE id=$1 FOR UPDATE",
-                )
-                .bind(&resource_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-                match current {
-                    None => 0,
-                    Some(current) => {
-                        let created_by: String = current.try_get("created_by")?;
-                        let created_epoch: i64 = current.try_get("created_epoch")?;
-                        if created_by != subject || created_epoch != expected_created_at_epoch {
-                            sqlx::query(
-                            "UPDATE cloud_retention_scope_items SET state='held', hold_code='resource_identity_changed', updated_at=now() \
-                             WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
-                        )
-                        .bind(&lease.job_id)
-                        .bind(&resource_kind)
-                        .bind(&resource_id)
-                        .execute(&mut *tx)
-                        .await?;
-                            held += 1;
-                            hold_reason = Some("resource_identity_changed");
-                            continue;
-                        }
-                        sqlx::query("DELETE FROM share_links WHERE id=$1")
-                            .bind(&resource_id)
-                            .execute(&mut *tx)
-                            .await?
-                            .rows_affected()
-                    }
-                }
-            }
-            _ => return Err(RetentionError::InvalidInput("resource_kind")),
+        let deleted = purge_scoped_resource(
+            &mut tx,
+            &lease,
+            &resource_kind,
+            &resource_id,
+            owner_id,
+            expected_created_at_epoch,
+            expected_revision,
+        )
+        .await?;
+        let Some(deleted) = deleted else {
+            sqlx::query(
+                "UPDATE cloud_retention_scope_items SET state='held', hold_code='resource_identity_changed', updated_at=now() \
+                 WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
+            )
+            .bind(&lease.job_id)
+            .bind(&resource_kind)
+            .bind(&resource_id)
+            .execute(&mut *tx)
+            .await?;
+            held += 1;
+            hold_reason = Some("resource_identity_changed");
+            continue;
         };
         let tombstone = serde_json::json!({
             "resource_kind": resource_kind,
             "resource_id": resource_id,
             "ownership_kind": ownership_kind,
-            "expected_owner_id": subject,
+            "expected_owner_id": owner_id,
             "expected_created_at": expected_created_at_epoch,
             "expected_revision": expected_revision,
             "already_absent": deleted == 0,
@@ -1330,7 +1954,7 @@ async fn run_once_with_scope(
         .bind(&resource_kind)
         .bind(&resource_id)
         .bind(&ownership_kind)
-        .bind(subject)
+        .bind(owner_id)
         .bind(expected_created_at_epoch)
         .bind(expected_revision)
         .bind(&tombstone)
@@ -1347,28 +1971,75 @@ async fn run_once_with_scope(
         .await?;
         processed += 1;
     }
+    if lease.scope_kind == ScopeKind::SharedOrganisation.as_str() && processed > 0 {
+        let org_id = lease
+            .organisation_id
+            .as_deref()
+            .ok_or(RetentionError::Held("organisation scope is missing"))?;
+        sqlx::query(
+            "UPDATE cloud_retention_jobs SET execution_scope_generation=( \
+                 SELECT retention_generation FROM organizations WHERE id=$2) \
+             WHERE job_id=$1 AND state='leased' AND lease_owner=$3",
+        )
+        .bind(&lease.job_id)
+        .bind(org_id)
+        .bind(&lease.worker_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     let next_state = if held > 0 {
         RetentionState::Held
     } else {
         let remaining: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND state='planned'",
+            "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND state='dry_run'",
         )
         .bind(&lease.job_id)
         .fetch_one(&mut *tx)
         .await?;
         if remaining == 0 {
             RetentionState::Completed
+        } else if processed > 0 {
+            sqlx::query(
+                "UPDATE cloud_retention_purge_approvals SET state='stale',invalidated_at=now() \
+                 WHERE job_id=$1 AND state='active'",
+            )
+            .bind(&lease.job_id)
+            .execute(&mut *tx)
+            .await?;
+            set_job_hold(&mut tx, &lease, "restore_evidence_stale").await?;
+            RetentionState::Held
         } else {
             RetentionState::Ready
         }
     };
     if held > 0 {
+        if processed > 0 {
+            sqlx::query(
+                "UPDATE cloud_retention_purge_approvals SET state='stale',invalidated_at=now() \
+                 WHERE job_id=$1 AND state='active'",
+            )
+            .bind(&lease.job_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         set_job_hold(
             &mut tx,
             &lease,
             hold_reason.unwrap_or("retention_scope_held"),
         )
         .await?;
+    } else if next_state == RetentionState::Completed {
+        sqlx::query(
+            "UPDATE cloud_retention_purge_approvals SET state='completed',invalidated_at=now() \
+             WHERE job_id=$1 AND state='active'",
+        )
+        .bind(&lease.job_id)
+        .execute(&mut *tx)
+        .await?;
+        clear_lease(&mut tx, &lease, next_state).await?;
+    } else if next_state == RetentionState::Held {
+        // The hold was set above because every successful batch changes the journal. A new
+        // independent restore attestation and approval are required before another batch.
     } else {
         clear_lease(&mut tx, &lease, next_state).await?;
     }
@@ -1412,6 +2083,189 @@ async fn lock_matching_notice(
     Ok(notice.is_some())
 }
 
+/// Delete one previously reviewed resource with its full incarnation and owner predicate. A
+/// parent is only deleted after all of its scoped children have been deleted in an earlier
+/// step of the same ordered batch. Returning `None` means an existing row no longer matches
+/// the reviewed identity, so the caller parks the job instead of journalling a deletion.
+async fn purge_scoped_resource(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &RetentionLease,
+    kind: &str,
+    id: &str,
+    owner_id: &str,
+    created_at: i64,
+    revision: Option<i64>,
+) -> RetentionResult<Option<u64>> {
+    let shared = lease.scope_kind == ScopeKind::SharedOrganisation.as_str();
+    let affected = match kind {
+        "project" if !shared => sqlx::query(
+            "DELETE FROM projects p WHERE p.id=$1 AND p.owner_id=$2 AND p.org_id IS NULL \
+             AND (extract(epoch FROM p.created_at)*1000000)::bigint=$3 \
+             AND NOT EXISTS (SELECT 1 FROM environments e WHERE e.project_id=p.id)",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected(),
+        "project" => sqlx::query(
+            "DELETE FROM projects p WHERE p.id=$1 AND p.org_id=$2 \
+             AND (extract(epoch FROM p.created_at)*1000000)::bigint=$3 \
+             AND NOT EXISTS (SELECT 1 FROM environments e WHERE e.project_id=p.id)",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected(),
+        "environment" if !shared => sqlx::query(
+            "DELETE FROM environments e USING projects p WHERE e.id=$1 AND e.project_id=p.id \
+             AND p.owner_id=$2 AND p.org_id IS NULL AND e.revision=$3 \
+             AND (extract(epoch FROM e.created_at)*1000000)::bigint=$4 \
+             AND NOT EXISTS (SELECT 1 FROM environment_grants g WHERE g.env_id=e.id) \
+             AND NOT EXISTS (SELECT 1 FROM machine_tokens m WHERE m.env_id=e.id)",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(revision)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected(),
+        "environment" => sqlx::query(
+            "DELETE FROM environments e USING projects p WHERE e.id=$1 AND e.project_id=p.id \
+             AND p.org_id=$2 AND e.revision=$3 \
+             AND (extract(epoch FROM e.created_at)*1000000)::bigint=$4 \
+             AND NOT EXISTS (SELECT 1 FROM environment_grants g WHERE g.env_id=e.id) \
+             AND NOT EXISTS (SELECT 1 FROM machine_tokens m WHERE m.env_id=e.id)",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(revision)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected(),
+        "share" if !shared => sqlx::query(
+            "DELETE FROM share_links WHERE id=$1 AND created_by=$2 \
+             AND (extract(epoch FROM created_at)*1000000)::bigint=$3",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected(),
+        "grant" => {
+            let parts = parse_composite_resource_id(id)?;
+            let env_id = &parts[0];
+            let user_id = &parts[1];
+            let owner_predicate = if shared {
+                "p.org_id=$3"
+            } else {
+                "p.owner_id=$3 AND p.org_id IS NULL"
+            };
+            let sql = format!(
+                "DELETE FROM environment_grants g USING environments e, projects p \
+                 WHERE g.env_id=$1 AND g.user_id=$2 AND e.id=g.env_id AND p.id=e.project_id \
+                   AND {owner_predicate} AND (extract(epoch FROM g.created_at)*1000000)::bigint=$4"
+            );
+            sqlx::query(&sql)
+                .bind(env_id)
+                .bind(user_id)
+                .bind(owner_id)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+        }
+        "machine_token" => {
+            let parts = parse_composite_resource_id(id)?;
+            let token_id = &parts[0];
+            let env_id = &parts[1];
+            let owner_predicate = if shared {
+                "p.org_id=$3"
+            } else {
+                "p.owner_id=$3 AND p.org_id IS NULL"
+            };
+            let sql = format!(
+                "DELETE FROM machine_tokens m USING environments e, projects p \
+                 WHERE m.id=$1 AND m.env_id=$2 AND e.id=m.env_id AND p.id=e.project_id \
+                   AND {owner_predicate} AND (extract(epoch FROM m.created_at)*1000000)::bigint=$4"
+            );
+            sqlx::query(&sql)
+                .bind(token_id)
+                .bind(env_id)
+                .bind(owner_id)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+        }
+        _ => return Err(RetentionError::InvalidInput("resource_kind")),
+    };
+    if affected > 0 {
+        return Ok(Some(affected));
+    }
+    let still_exists: bool = match kind {
+        "project" => {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1)")
+                .bind(id)
+                .fetch_one(&mut **tx)
+                .await?
+        }
+        "environment" => {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM environments WHERE id=$1)")
+                .bind(id)
+                .fetch_one(&mut **tx)
+                .await?
+        }
+        "share" => {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM share_links WHERE id=$1)")
+                .bind(id)
+                .fetch_one(&mut **tx)
+                .await?
+        }
+        "grant" => {
+            let parts = parse_composite_resource_id(id)?;
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM environment_grants WHERE env_id=$1 AND user_id=$2)",
+            )
+            .bind(&parts[0])
+            .bind(&parts[1])
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        "machine_token" => {
+            let parts = parse_composite_resource_id(id)?;
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM machine_tokens WHERE id=$1 AND env_id=$2)",
+            )
+            .bind(&parts[0])
+            .bind(&parts[1])
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        _ => return Err(RetentionError::InvalidInput("resource_kind")),
+    };
+    Ok((!still_exists).then_some(0))
+}
+
+fn parse_composite_resource_id(id: &str) -> RetentionResult<[String; 2]> {
+    let parts: Vec<String> = serde_json::from_str(id)
+        .map_err(|_| RetentionError::InvalidInput("composite resource id"))?;
+    if parts.len() != 2 || parts.iter().any(|part| part.trim().is_empty()) {
+        return Err(RetentionError::InvalidInput("composite resource id"));
+    }
+    let mut parts = parts.into_iter();
+    Ok([
+        parts.next().expect("validated length"),
+        parts.next().expect("validated length"),
+    ])
+}
+
 async fn validate_scope_inventory(
     tx: &mut Transaction<'_, Postgres>,
     lease: &RetentionLease,
@@ -1445,16 +2299,39 @@ async fn validate_scope_inventory(
     .bind(MAX_SCOPE_ITEMS + 1)
     .fetch_all(&mut **tx)
     .await?;
+    let grants = sqlx::query(
+        "SELECT g.env_id,g.user_id FROM environment_grants g \
+         JOIN environments e ON e.id=g.env_id JOIN projects p ON p.id=e.project_id \
+         WHERE p.owner_id=$1 AND p.org_id IS NULL ORDER BY g.env_id,g.user_id LIMIT $2",
+    )
+    .bind(subject)
+    .bind(MAX_SCOPE_ITEMS + 1)
+    .fetch_all(&mut **tx)
+    .await?;
+    let machine_tokens = sqlx::query(
+        "SELECT m.id,m.env_id FROM machine_tokens m \
+         JOIN environments e ON e.id=m.env_id JOIN projects p ON p.id=e.project_id \
+         WHERE p.owner_id=$1 AND p.org_id IS NULL ORDER BY m.id LIMIT $2",
+    )
+    .bind(subject)
+    .bind(MAX_SCOPE_ITEMS + 1)
+    .fetch_all(&mut **tx)
+    .await?;
     let max_scope_items = MAX_SCOPE_ITEMS as usize;
-    if projects.len() + environments.len() + shares.len() > max_scope_items
+    if projects.len() + environments.len() + shares.len() + grants.len() + machine_tokens.len()
+        > max_scope_items
         || projects.len() > max_scope_items
         || environments.len() > max_scope_items
         || shares.len() > max_scope_items
+        || grants.len() > max_scope_items
+        || machine_tokens.len() > max_scope_items
     {
         return Ok(Some("scope_exceeds_bound"));
     }
 
-    let mut current = HashSet::with_capacity(projects.len() + environments.len() + shares.len());
+    let mut current = HashSet::with_capacity(
+        projects.len() + environments.len() + shares.len() + grants.len() + machine_tokens.len(),
+    );
     current.extend(projects.into_iter().map(|id| ("project".to_owned(), id)));
     current.extend(
         environments
@@ -1462,9 +2339,29 @@ async fn validate_scope_inventory(
             .map(|id| ("environment".to_owned(), id)),
     );
     current.extend(shares.into_iter().map(|id| ("share".to_owned(), id)));
+    for row in grants {
+        current.insert((
+            "grant".to_owned(),
+            serde_json::json!([
+                row.try_get::<String, _>("env_id")?,
+                row.try_get::<String, _>("user_id")?
+            ])
+            .to_string(),
+        ));
+    }
+    for row in machine_tokens {
+        current.insert((
+            "machine_token".to_owned(),
+            serde_json::json!([
+                row.try_get::<String, _>("id")?,
+                row.try_get::<String, _>("env_id")?
+            ])
+            .to_string(),
+        ));
+    }
     let rows = sqlx::query(
         "SELECT resource_kind, resource_id FROM cloud_retention_scope_items \
-         WHERE job_id=$1 ORDER BY resource_kind, resource_id LIMIT $2",
+         WHERE job_id=$1 AND state<>'deleted' ORDER BY resource_kind, resource_id LIMIT $2",
     )
     .bind(&lease.job_id)
     .bind(MAX_SCOPE_ITEMS + 1)
@@ -1603,6 +2500,7 @@ async fn lock_shared_scope_rows(
 async fn validate_shared_dry_run(
     tx: &mut Transaction<'_, Postgres>,
     lease: &RetentionLease,
+    execution_generation: Option<i64>,
 ) -> RetentionResult<Option<&'static str>> {
     if lease.scope_kind != ScopeKind::SharedOrganisation.as_str() {
         return Ok(Some("unsupported_scope"));
@@ -1626,7 +2524,7 @@ async fn validate_shared_dry_run(
     if lifecycle != "active" {
         return Ok(Some("organisation_not_active"));
     }
-    if generation != expected_generation {
+    if generation != execution_generation.unwrap_or(expected_generation) {
         return Ok(Some("scope_generation_changed"));
     }
     let deletion_pending: bool = sqlx::query_scalar(
@@ -1902,7 +2800,8 @@ async fn validate_shared_scope_inventory(
     }
     let rows = sqlx::query(
         "SELECT resource_kind,resource_id,expected_created_at,expected_revision \
-         FROM cloud_retention_scope_items WHERE job_id=$1 ORDER BY resource_kind,resource_id LIMIT 4097",
+         FROM cloud_retention_scope_items WHERE job_id=$1 AND state<>'deleted' \
+         ORDER BY resource_kind,resource_id LIMIT 4097",
     )
     .bind(&lease.job_id)
     .fetch_all(&mut **tx)
@@ -2109,6 +3008,41 @@ async fn validate_dry_run_resource(
                 }
             }
         }
+        "grant" => {
+            let parts = parse_composite_resource_id(resource_id)?;
+            let found: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM environment_grants g \
+                 JOIN environments e ON e.id=g.env_id JOIN projects p ON p.id=e.project_id \
+                 WHERE g.env_id=$1 AND g.user_id=$2 AND p.owner_id=$3 AND p.org_id IS NULL \
+                   AND g.user_id=p.owner_id \
+                   AND (extract(epoch FROM g.created_at)*1000000)::bigint=$4)",
+            )
+            .bind(&parts[0])
+            .bind(&parts[1])
+            .bind(subject)
+            .bind(expected_created_at)
+            .fetch_one(&mut **tx)
+            .await?;
+            (!found).then_some("resource_identity_changed")
+        }
+        "machine_token" => {
+            let parts = parse_composite_resource_id(resource_id)?;
+            let found: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM machine_tokens m \
+                 JOIN environments e ON e.id=m.env_id JOIN projects p ON p.id=e.project_id \
+                 WHERE m.id=$1 AND m.env_id=$2 AND p.owner_id=$3 AND p.org_id IS NULL \
+                   AND NOT EXISTS (SELECT 1 FROM environment_grants g \
+                                   WHERE g.env_id=e.id AND g.user_id<>p.owner_id) \
+                   AND (extract(epoch FROM m.created_at)*1000000)::bigint=$4)",
+            )
+            .bind(&parts[0])
+            .bind(&parts[1])
+            .bind(subject)
+            .bind(expected_created_at)
+            .fetch_one(&mut **tx)
+            .await?;
+            (!found).then_some("resource_identity_changed")
+        }
         _ => return Err(RetentionError::InvalidInput("resource_kind")),
     };
     Ok(reason)
@@ -2210,6 +3144,35 @@ mod tests {
         assert_eq!(RetentionMode::DryRun.as_str(), "dry_run");
         assert_eq!(RetentionMode::Purge.as_str(), "purge");
         assert_eq!(RetentionState::Held.as_str(), "held");
+    }
+
+    #[test]
+    fn restore_evidence_accepts_an_empty_journal_but_rejects_tampering() {
+        let key = b"a separate restore evidence HMAC key with enough entropy";
+        let mut evidence = RestoreEvidenceAttestation {
+            evidence_id: "restore-evidence:test-run-1".into(),
+            release_sha: "a".repeat(40),
+            backup_fingerprint: "b".repeat(64),
+            sidecar_sha256: "c".repeat(64),
+            journal_entry_count: 0,
+            replay_entry_count: 0,
+            first_replay_deleted_count: 0,
+            second_replay_deleted_count: 0,
+            incarnation_guard_verified: true,
+            signature: String::new(),
+        };
+        evidence.signature = sign_restore_evidence(&evidence, key);
+        assert!(evidence
+            .validate_and_verify(&evidence.release_sha, key)
+            .is_ok());
+
+        evidence.first_replay_deleted_count = 1;
+        assert!(matches!(
+            evidence.validate_and_verify(&evidence.release_sha, key),
+            Err(RetentionError::Held(
+                "restore evidence signature is invalid"
+            ))
+        ));
     }
 
     #[test]
