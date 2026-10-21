@@ -283,6 +283,7 @@ impl RestoreEvidenceAttestation {
             || self.journal_entry_count < 0
             || self.replay_entry_count != self.journal_entry_count
             || self.first_replay_deleted_count < 0
+            || self.first_replay_deleted_count > self.replay_entry_count
             || self.second_replay_deleted_count != 0
             || !self.incarnation_guard_verified
             || hmac_key.len() < 32
@@ -3166,11 +3167,42 @@ mod tests {
             .validate_and_verify(&evidence.release_sha, key)
             .is_ok());
 
-        evidence.first_replay_deleted_count = 1;
+        evidence.backup_fingerprint.replace_range(0..1, "c");
         assert!(matches!(
             evidence.validate_and_verify(&evidence.release_sha, key),
             Err(RetentionError::Held(
                 "restore evidence signature is invalid"
+            ))
+        ));
+    }
+
+    #[test]
+    fn restore_evidence_allows_already_absent_rows_but_bounds_replay_deletions() {
+        let key = b"a separate restore evidence HMAC key with enough entropy";
+        let mut evidence = RestoreEvidenceAttestation {
+            evidence_id: "restore-evidence:already-absent-rows".into(),
+            release_sha: "a".repeat(40),
+            backup_fingerprint: "b".repeat(64),
+            sidecar_sha256: "c".repeat(64),
+            journal_entry_count: 3,
+            replay_entry_count: 3,
+            // The backup may already omit rows purged before the dump was taken.
+            first_replay_deleted_count: 0,
+            second_replay_deleted_count: 0,
+            incarnation_guard_verified: true,
+            signature: String::new(),
+        };
+        evidence.signature = sign_restore_evidence(&evidence, key);
+        assert!(evidence
+            .validate_and_verify(&evidence.release_sha, key)
+            .is_ok());
+
+        evidence.first_replay_deleted_count = 4;
+        evidence.signature = sign_restore_evidence(&evidence, key);
+        assert!(matches!(
+            evidence.validate_and_verify(&evidence.release_sha, key),
+            Err(RetentionError::Held(
+                "restore evidence is incomplete or stale"
             ))
         ));
     }

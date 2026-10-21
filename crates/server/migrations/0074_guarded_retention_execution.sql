@@ -23,7 +23,8 @@ CREATE TABLE cloud_retention_restore_evidence (
     signature                   TEXT NOT NULL CHECK (signature ~ '^[0-9a-f]{64}$'),
     recorded_by                 TEXT NOT NULL CHECK (length(btrim(recorded_by)) BETWEEN 1 AND 80),
     recorded_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (replay_entry_count = journal_entry_count)
+    CHECK (replay_entry_count = journal_entry_count),
+    CHECK (first_replay_deleted_count <= replay_entry_count)
 );
 
 CREATE TABLE cloud_retention_purge_approvals (
