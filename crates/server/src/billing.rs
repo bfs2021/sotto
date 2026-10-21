@@ -3061,7 +3061,8 @@ pub(crate) async fn sponsored_provider_phases(
     let pending_changes: Vec<SponsoredSchedulePendingChange> = sqlx::query_as(
         "SELECT beneficiary_id, action, effective_until \
          FROM billing_sponsored_operations \
-         WHERE organization_id = $1 AND state IN ('pending', 'checkout_created', 'provider_pending') \
+         WHERE organization_id = $1 \
+           AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown') \
            AND action IN ('remove', 'replace') ORDER BY created_at",
     )
     .bind(organization_id)

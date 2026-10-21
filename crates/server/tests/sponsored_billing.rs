@@ -220,19 +220,49 @@ impl SubscriptionProvider for AppliedScheduleProvider {
         phases: &[sotto_server::billing::SponsoredSubscriptionPhase],
     ) -> ProviderResult<Option<sotto_server::billing::SponsoredSubscriptionSnapshot>> {
         self.verification_calls.fetch_add(1, Ordering::SeqCst);
-        let applied_phase = phases.iter().find(|phase| {
-            phase.start_at_epoch == self.period_end
-                && phase.end_at_epoch.is_none()
-                && phase.items
-                    == [SponsoredSubscriptionItemRequest {
-                        provider_price_id: "price_recovery_test".into(),
-                        quantity: self.applied_quantity,
-                    }]
+        let phase_at_end = phases
+            .iter()
+            .find(|phase| {
+                phase.start_at_epoch <= self.period_end
+                    && phase.end_at_epoch.is_none_or(|end| self.period_end < end)
+            })
+            .or_else(|| {
+                phases
+                    .iter()
+                    .find(|phase| phase.start_at_epoch == self.period_end)
+            });
+        let normalized_phases = phase_at_end.map(|phase| {
+            let mut normalized = vec![sotto_server::billing::SponsoredSubscriptionPhase {
+                start_at_epoch: self.period_end,
+                end_at_epoch: phase.end_at_epoch,
+                items: phase.items.clone(),
+            }];
+            normalized.extend(
+                phases
+                    .iter()
+                    .filter(|later| later.start_at_epoch > self.period_end)
+                    .cloned(),
+            );
+            if normalized
+                .last()
+                .is_some_and(|phase| phase.items.is_empty())
+            {
+                normalized.pop();
+            }
+            normalized
         });
+        let expected_phases = [sotto_server::billing::SponsoredSubscriptionPhase {
+            start_at_epoch: self.period_end,
+            end_at_epoch: None,
+            items: vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_recovery_test".into(),
+                quantity: self.applied_quantity,
+            }],
+        }];
         if subscription_id != self.subscription_id
             || expected_period_start != self.period_start
             || expected_period_end != self.period_end
-            || applied_phase.is_none()
+            || normalized_phases.as_deref() != Some(expected_phases.as_slice())
         {
             return Ok(None);
         }
@@ -247,7 +277,7 @@ impl SubscriptionProvider for AppliedScheduleProvider {
         _idempotency_key: &str,
     ) -> ProviderResult<sotto_server::billing::SponsoredSubscriptionSnapshot> {
         self.update_calls.fetch_add(1, Ordering::SeqCst);
-        Err(unsupported_provider_call())
+        Ok(self.snapshot())
     }
 }
 
@@ -1335,6 +1365,177 @@ async fn older_sponsored_schedule_recovery_settles_when_newer_schedule_includes_
         .execute(&pool)
         .await
         .expect("delete newer operation beneficiary after fixture cleanup");
+}
+
+#[tokio::test]
+async fn unknown_removal_recovery_replays_when_stripe_still_has_both_seats() {
+    let _guard = TEST_LOCK.lock().await;
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let fixture = create_recovery_fixture(&pool, &Uuid::new_v4().to_string(), true).await;
+    let first_payment = SponsoredProviderEvidence {
+        customer_id: Some(fixture.customer_id.clone()),
+        subscription_id: fixture.subscription_id.clone(),
+        schedule_id: Some(fixture.schedule_id.clone()),
+        checkout_session_id: None,
+        payment_reference: format!("pi_first_{}", Uuid::new_v4()),
+        provider_item_id: Some("si_recovery_test".into()),
+    };
+    let mut tx = pool.begin().await.expect("begin first seat settlement");
+    complete_paid_checkout(&mut tx, &fixture.operation_id, &first_payment)
+        .await
+        .expect("activate the first seat");
+    tx.commit().await.expect("commit first seat settlement");
+
+    let second_beneficiary = format!("sponsored-recovery-second-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) \
+         VALUES ($1, 'sponsored-recovery-test', $1)",
+    )
+    .bind(&second_beneficiary)
+    .execute(&pool)
+    .await
+    .expect("insert second beneficiary");
+    let now = sotto_server::sponsored_billing::current_epoch();
+    let add_request = SponsoredSeatRequest {
+        action: SponsoredSeatAction::Add,
+        beneficiary_id: second_beneficiary.clone(),
+        replacement_beneficiary_id: None,
+        offer: BillingOffer::StandardMonthly,
+        quote_version: 1,
+        quote_expires_at_epoch: now + 600,
+        effective_from: now + 300,
+        effective_until: None,
+        idempotency_key: format!("second-seat-{}", Uuid::new_v4()),
+    };
+    let mut tx = pool.begin().await.expect("begin second seat operation");
+    let second_operation = begin_operation(
+        &mut tx,
+        &fixture.organization_id,
+        &fixture.owner_id,
+        &add_request,
+        now,
+    )
+    .await
+    .expect("create second seat operation");
+    tx.commit().await.expect("commit second seat operation");
+    let second_payment = SponsoredProviderEvidence {
+        customer_id: Some(fixture.customer_id.clone()),
+        subscription_id: fixture.subscription_id.clone(),
+        schedule_id: Some(fixture.schedule_id.clone()),
+        checkout_session_id: None,
+        payment_reference: format!("pi_second_{}", Uuid::new_v4()),
+        provider_item_id: Some("si_recovery_test".into()),
+    };
+    let mut tx = pool.begin().await.expect("begin second seat settlement");
+    complete_paid_checkout(&mut tx, &second_operation.operation_id, &second_payment)
+        .await
+        .expect("activate the second seat");
+    tx.commit().await.expect("commit second seat settlement");
+
+    let removal_request = SponsoredSeatRequest {
+        action: SponsoredSeatAction::Remove,
+        beneficiary_id: fixture.beneficiary_id.clone(),
+        replacement_beneficiary_id: None,
+        offer: BillingOffer::StandardMonthly,
+        quote_version: 1,
+        quote_expires_at_epoch: now + 600,
+        effective_from: now + 300,
+        effective_until: Some(fixture.period_end),
+        idempotency_key: format!("remove-first-seat-{}", Uuid::new_v4()),
+    };
+    let mut tx = pool.begin().await.expect("begin removal operation");
+    let removal = begin_operation(
+        &mut tx,
+        &fixture.organization_id,
+        &fixture.owner_id,
+        &removal_request,
+        now,
+    )
+    .await
+    .expect("create removal operation");
+    persist_provider_request(
+        &mut tx,
+        &removal.operation_id,
+        &SponsoredProviderRequest::ScheduleUpdate {
+            organization_id: fixture.organization_id.clone(),
+            subscription_id: fixture.subscription_id.clone(),
+            expected_period_start: fixture.period_start,
+            expected_period_end: fixture.period_end,
+            phases: vec![sotto_server::billing::SponsoredSubscriptionPhase {
+                start_at_epoch: fixture.period_end,
+                end_at_epoch: None,
+                items: vec![SponsoredSubscriptionItemRequest {
+                    provider_price_id: "price_recovery_test".into(),
+                    quantity: 1,
+                }],
+            }],
+        },
+    )
+    .await
+    .expect("save the removal request that timed out");
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET state = 'unknown', \
+         provider_subscription_id = $2 WHERE operation_id = $1",
+    )
+    .bind(&removal.operation_id)
+    .bind(&fixture.subscription_id)
+    .execute(&mut *tx)
+    .await
+    .expect("model a timed-out provider send");
+    tx.commit().await.expect("commit timed-out removal");
+
+    let provider = Arc::new(AppliedScheduleProvider {
+        subscription_id: fixture.subscription_id.clone(),
+        customer_id: fixture.customer_id.clone(),
+        schedule_id: fixture.schedule_id.clone(),
+        period_start: fixture.period_start,
+        period_end: fixture.period_end,
+        applied_quantity: 2,
+        verification_calls: AtomicUsize::new(0),
+        update_calls: AtomicUsize::new(0),
+    });
+    let billing = BillingState::with_provider(
+        provider.clone(),
+        "whsec_test".into(),
+        "https://app.example.test".into(),
+    )
+    .with_price_catalogue(BillingPriceIds {
+        standard_monthly: "price_recovery_test".into(),
+        standard_annual: "price_recovery_annual".into(),
+        founding_monthly: "price_recovery_founding_monthly".into(),
+        founding_annual: "price_recovery_founding_annual".into(),
+    });
+
+    recover_sponsored_billing_operation_by_id(&pool, &billing, &removal.operation_id)
+        .await
+        .expect("replay the removal absent from Stripe");
+    assert_eq!(provider.verification_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.update_calls.load(Ordering::SeqCst), 1);
+    let (operation_state, seat_state, effective_until): (String, String, Option<i64>) =
+        sqlx::query_as(
+            "SELECT operation.state, seat.state, seat.effective_until \
+             FROM billing_sponsored_operations AS operation \
+             JOIN billing_sponsored_seats AS seat \
+               ON seat.organization_id = operation.organization_id \
+              AND seat.beneficiary_id = operation.beneficiary_id \
+             WHERE operation.operation_id = $1",
+        )
+        .bind(&removal.operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered removal state");
+    assert_eq!(operation_state, "provider_pending");
+    assert_eq!(seat_state, "scheduled_removal");
+    assert_eq!(effective_until, Some(fixture.period_end));
+
+    clean_recovery_fixture(&pool, &fixture).await;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&second_beneficiary)
+        .execute(&pool)
+        .await
+        .expect("delete second beneficiary after fixture cleanup");
 }
 
 #[tokio::test]
