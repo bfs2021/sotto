@@ -12,6 +12,10 @@ use uuid::Uuid;
 
 use crate::error::Error;
 
+/// Stop replaying an ambiguous Stripe refund create before its idempotency record can expire.
+/// Stripe retains idempotency keys for at least 24 hours; the one-hour margin is deliberate.
+pub const REFUND_CREATE_REPLAY_WINDOW_SECONDS: i64 = 23 * 60 * 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayerKind {
     Personal,
@@ -182,6 +186,7 @@ pub struct BillingRefundRequest {
     pub early_termination_confirmed_at_epoch: Option<i64>,
     pub effective_at_epoch: Option<i64>,
     pub provider_refund_id: Option<String>,
+    pub provider_refund_started_at_epoch: Option<i64>,
     pub result_code: Option<String>,
 }
 
@@ -330,7 +335,9 @@ pub async fn begin_provider_refund(
     request_id: &str,
 ) -> Result<BillingRefundRequest, BillingRefundError> {
     let updated = sqlx::query(
-        "UPDATE billing_correction_requests SET state = 'provider_pending', updated_at = now() \
+        "UPDATE billing_correction_requests SET state = 'provider_pending', \
+         provider_refund_started_at_epoch = COALESCE(provider_refund_started_at_epoch, \
+             FLOOR(EXTRACT(EPOCH FROM now()))::BIGINT), updated_at = now() \
          WHERE request_id = $1 AND state = 'approved' RETURNING request_id",
     )
     .bind(request_id)
@@ -346,6 +353,82 @@ pub async fn begin_provider_refund(
     load_request(tx, request_id).await
 }
 
+pub fn refund_create_replay_allowed(first_attempt_epoch: Option<i64>, now_epoch: i64) -> bool {
+    first_attempt_epoch.is_some_and(|first| {
+        first <= now_epoch && now_epoch.saturating_sub(first) < REFUND_CREATE_REPLAY_WINDOW_SECONDS
+    })
+}
+
+/// Park an ambiguous refund create when the original provider idempotency window has elapsed.
+/// A missing response is never treated as proof that no refund was created.
+pub async fn park_ambiguous_refund_create(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: &str,
+    now_epoch: i64,
+) -> Result<BillingRefundRequest, BillingRefundError> {
+    let current = load_request_for_update(tx, request_id).await?;
+    if current.state == CorrectionState::Unknown
+        && current.provider_refund_id.is_none()
+        && current.result_code.as_deref() == Some("refund_create_horizon_expired")
+    {
+        return Ok(current);
+    }
+    if current.state != CorrectionState::ProviderPending || current.provider_refund_id.is_some() {
+        return Err(BillingRefundError::InvalidTransition);
+    }
+    if refund_create_replay_allowed(current.provider_refund_started_at_epoch, now_epoch) {
+        return Err(BillingRefundError::InvalidTransition);
+    }
+    sqlx::query(
+        "UPDATE billing_correction_requests SET state = 'unknown', \
+         result_code = 'refund_create_horizon_expired', updated_at = now() \
+         WHERE request_id = $1 AND state = 'provider_pending' AND provider_refund_id IS NULL",
+    )
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await?;
+    load_request(tx, request_id).await
+}
+
+/// Record an unrecognised Stripe refund status without treating it as success or failure.
+pub async fn record_provider_unknown(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: &str,
+    provider_refund_id: &str,
+    result_code: &str,
+) -> Result<BillingRefundRequest, BillingRefundError> {
+    if provider_refund_id.trim().is_empty() || result_code.trim().is_empty() {
+        return Err(BillingRefundError::InvalidField("provider refund evidence"));
+    }
+    let current = load_request_for_update(tx, request_id).await?;
+    if current.state == CorrectionState::Unknown
+        && current.provider_refund_id.as_deref() == Some(provider_refund_id)
+        && current.result_code.as_deref() == Some(result_code)
+    {
+        return Ok(current);
+    }
+    if !matches!(
+        current.state,
+        CorrectionState::ProviderPending | CorrectionState::Unknown
+    ) || current
+        .provider_refund_id
+        .as_deref()
+        .is_some_and(|existing| existing != provider_refund_id)
+    {
+        return Err(BillingRefundError::InvalidTransition);
+    }
+    sqlx::query(
+        "UPDATE billing_correction_requests SET state = 'unknown', provider_refund_id = $2, \
+         result_code = $3, updated_at = now() WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .bind(provider_refund_id)
+    .bind(result_code)
+    .execute(&mut **tx)
+    .await?;
+    load_request(tx, request_id).await
+}
+
 pub async fn record_provider_pending(
     tx: &mut Transaction<'_, Postgres>,
     request_id: &str,
@@ -355,19 +438,39 @@ pub async fn record_provider_pending(
         return Err(BillingRefundError::InvalidField("provider_refund_id"));
     }
     let current = load_request_for_update(tx, request_id).await?;
-    if current.state == CorrectionState::ProviderPending {
-        if current.provider_refund_id.as_deref() == Some(provider_refund_id) {
-            return Ok(current);
+    match current.state {
+        CorrectionState::ProviderPending => {
+            if current
+                .provider_refund_id
+                .as_deref()
+                .is_some_and(|existing| existing != provider_refund_id)
+            {
+                return Err(BillingRefundError::RequestConflict);
+            }
+            if current.provider_refund_id.as_deref() == Some(provider_refund_id)
+                && current.result_code.is_none()
+            {
+                return Ok(current);
+            }
         }
-        if current.provider_refund_id.is_some() {
-            return Err(BillingRefundError::RequestConflict);
+        CorrectionState::Unknown => {
+            if current
+                .provider_refund_id
+                .as_deref()
+                .is_some_and(|existing| existing != provider_refund_id)
+            {
+                return Err(BillingRefundError::RequestConflict);
+            }
+            if current.provider_refund_id.is_none() {
+                return Err(BillingRefundError::InvalidTransition);
+            }
         }
-    } else if current.state != CorrectionState::Approved {
-        return Err(BillingRefundError::InvalidTransition);
+        CorrectionState::Approved => {}
+        _ => return Err(BillingRefundError::InvalidTransition),
     }
     sqlx::query(
         "UPDATE billing_correction_requests SET state = 'provider_pending', \
-         provider_refund_id = $2, updated_at = now() WHERE request_id = $1",
+         provider_refund_id = $2, result_code = NULL, updated_at = now() WHERE request_id = $1",
     )
     .bind(request_id)
     .bind(provider_refund_id)
@@ -390,11 +493,13 @@ pub async fn record_provider_refund(
         return Err(BillingRefundError::InvalidField("result_code"));
     }
     let current = load_request_for_update(tx, request_id).await?;
-    if current.state == CorrectionState::ProviderPending
-        && current
-            .provider_refund_id
-            .as_deref()
-            .is_some_and(|existing| existing != provider_refund_id)
+    if matches!(
+        current.state,
+        CorrectionState::ProviderPending | CorrectionState::Unknown
+    ) && current
+        .provider_refund_id
+        .as_deref()
+        .is_some_and(|existing| existing != provider_refund_id)
     {
         return Err(BillingRefundError::RequestConflict);
     }
@@ -422,7 +527,7 @@ pub async fn record_provider_refund(
     }
     if !matches!(
         current.state,
-        CorrectionState::Approved | CorrectionState::ProviderPending
+        CorrectionState::Approved | CorrectionState::ProviderPending | CorrectionState::Unknown
     ) {
         return Err(BillingRefundError::InvalidTransition);
     }
@@ -569,6 +674,7 @@ fn request_from_row(
             .try_get("early_termination_confirmed_at_epoch")?,
         effective_at_epoch: row.try_get("effective_at_epoch")?,
         provider_refund_id: row.try_get("provider_refund_id")?,
+        provider_refund_started_at_epoch: row.try_get("provider_refund_started_at_epoch")?,
         result_code: row.try_get("result_code")?,
     })
 }

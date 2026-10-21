@@ -4913,7 +4913,28 @@ async fn operator_process_refund(
         tx.commit().await?;
         return Ok(Json(personal_refund_view(request)));
     }
-    if current.state != billing_refunds::CorrectionState::ProviderPending {
+    if current.state == billing_refunds::CorrectionState::ProviderPending
+        && current.provider_refund_id.is_none()
+        && !billing_refunds::refund_create_replay_allowed(
+            current.provider_refund_started_at_epoch,
+            sponsored_billing::current_epoch(),
+        )
+    {
+        let mut tx = state.pool.begin().await?;
+        let request = billing_refunds::park_ambiguous_refund_create(
+            &mut tx,
+            &request_id,
+            sponsored_billing::current_epoch(),
+        )
+        .await
+        .map_err(Error::from)?;
+        tx.commit().await?;
+        return Ok(Json(personal_refund_view(request)));
+    }
+    let has_known_refund = current.provider_refund_id.is_some();
+    if current.state != billing_refunds::CorrectionState::ProviderPending
+        && !(current.state == billing_refunds::CorrectionState::Unknown && has_known_refund)
+    {
         return Ok(Json(personal_refund_view(current)));
     }
     let provider_key = format!("sotto-refund:{request_id}");
@@ -4950,12 +4971,20 @@ async fn operator_process_refund(
                 .await
                 .map_err(Error::from)?
         }
-        status => billing_refunds::record_provider_refund(
+        status @ ("failed" | "canceled") => billing_refunds::record_provider_refund(
             &mut tx,
             &request_id,
             &receipt.refund_id,
             false,
             Some(status),
+        )
+        .await
+        .map_err(Error::from)?,
+        _ => billing_refunds::record_provider_unknown(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            "provider_status_unrecognised",
         )
         .await
         .map_err(Error::from)?,

@@ -4,9 +4,11 @@ use sqlx::{postgres::PgConnectOptions, PgPool};
 use uuid::Uuid;
 
 use sotto_server::billing_refunds::{
-    begin_provider_refund, confirm_early_termination, create_request, record_provider_pending,
-    record_provider_refund, record_provider_termination, review_request, BillingRefundError,
+    begin_provider_refund, confirm_early_termination, create_request, park_ambiguous_refund_create,
+    record_provider_pending, record_provider_refund, record_provider_termination,
+    record_provider_unknown, refund_create_replay_allowed, review_request, BillingRefundError,
     CorrectionReason, CorrectionRequest, CorrectionState, PayerKind, RequestDisposition,
+    REFUND_CREATE_REPLAY_WINDOW_SECONDS,
 };
 use sotto_server::db;
 
@@ -143,16 +145,32 @@ async fn correction_replays_preserve_terms_until_confirmed_refund_and_early_end(
     review_request(&mut tx, &partial.request_id, true, None)
         .await
         .expect("approve partial correction");
-    begin_provider_refund(&mut tx, &partial.request_id)
+    let first_attempt = begin_provider_refund(&mut tx, &partial.request_id)
         .await
         .expect("start partial refund");
-    record_provider_pending(&mut tx, &partial.request_id, "re_partial_pending")
+    let attempt_replay = begin_provider_refund(&mut tx, &partial.request_id)
         .await
-        .expect("record pending partial refund");
+        .expect("replay provider-pending operation");
+    assert_eq!(
+        attempt_replay.provider_refund_started_at_epoch,
+        first_attempt.provider_refund_started_at_epoch
+    );
+    let unknown = record_provider_unknown(
+        &mut tx,
+        &partial.request_id,
+        "re_partial_pending",
+        "provider_status_unrecognised",
+    )
+    .await
+    .expect("persist an unrecognised provider result for later lookup");
+    assert_eq!(unknown.state, CorrectionState::Unknown);
     assert!(matches!(
         record_provider_pending(&mut tx, &partial.request_id, "re_other_pending").await,
         Err(BillingRefundError::RequestConflict)
     ));
+    record_provider_pending(&mut tx, &partial.request_id, "re_partial_pending")
+        .await
+        .expect("record a later pending read for the same refund id");
     let partial = record_provider_refund(
         &mut tx,
         &partial.request_id,
@@ -209,5 +227,77 @@ async fn correction_replays_preserve_terms_until_confirmed_refund_and_early_end(
     .await
     .expect("read early-ended account");
     assert_eq!(account, ("canceled".into(), 1_900_000_000));
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn ambiguous_refund_create_parks_before_provider_idempotency_expires() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().to_string();
+    let user = format!("billing-refund-test-{fixture}-user");
+    let operation = format!("billing-refund-test-{fixture}-operation");
+    cleanup(&pool, &fixture).await;
+    seed_personal_account(&pool, &user, &operation).await;
+
+    let mut tx = pool.begin().await.expect("begin ambiguous refund");
+    let (_, request) = create_request(&mut tx, &request(&user, "ambiguous", false))
+        .await
+        .expect("create correction");
+    review_request(&mut tx, &request.request_id, true, None)
+        .await
+        .expect("approve correction");
+    let pending = begin_provider_refund(&mut tx, &request.request_id)
+        .await
+        .expect("persist first provider attempt before I/O");
+    let first_attempt = pending
+        .provider_refund_started_at_epoch
+        .expect("first attempt timestamp is persisted");
+    assert!(refund_create_replay_allowed(
+        Some(first_attempt),
+        first_attempt + REFUND_CREATE_REPLAY_WINDOW_SECONDS - 1
+    ));
+    assert!(!refund_create_replay_allowed(
+        Some(first_attempt),
+        first_attempt + REFUND_CREATE_REPLAY_WINDOW_SECONDS
+    ));
+    assert!(!refund_create_replay_allowed(None, first_attempt));
+    tx.commit()
+        .await
+        .expect("commit provider-pending correction");
+
+    let mut tx = pool.begin().await.expect("begin horizon parking");
+    let parked = park_ambiguous_refund_create(
+        &mut tx,
+        &request.request_id,
+        first_attempt + REFUND_CREATE_REPLAY_WINDOW_SECONDS,
+    )
+    .await
+    .expect("park ambiguous outcome without a second payout");
+    assert_eq!(parked.state, CorrectionState::Unknown);
+    assert_eq!(
+        parked.result_code.as_deref(),
+        Some("refund_create_horizon_expired")
+    );
+    assert_eq!(parked.provider_refund_id, None);
+    let replay = park_ambiguous_refund_create(
+        &mut tx,
+        &request.request_id,
+        first_attempt + REFUND_CREATE_REPLAY_WINDOW_SECONDS,
+    )
+    .await
+    .expect("parking is idempotent");
+    assert_eq!(replay.request_id, parked.request_id);
+    tx.commit().await.expect("commit parked correction");
+
+    let account: (String, i64) = sqlx::query_as(
+        "SELECT state, paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user)
+    .fetch_one(&pool)
+    .await
+    .expect("read account after ambiguous refund");
+    assert_eq!(account, ("active".into(), 1_901_000_000));
     cleanup(&pool, &fixture).await;
 }
