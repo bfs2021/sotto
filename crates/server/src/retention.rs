@@ -104,6 +104,7 @@ pub struct RetentionIntent {
     pub notice_evidence_epoch: Option<i64>,
     pub expected_coverage_revision: Option<i64>,
     pub expected_scope_generation: Option<i64>,
+    pub eligibility_loss_epoch: Option<i64>,
 }
 
 impl RetentionIntent {
@@ -132,8 +133,9 @@ impl RetentionIntent {
                     .as_deref()
                     .is_some_and(|id| !id.trim().is_empty())
                     && self.organisation_id.is_none()
-                    && self.expected_scope_generation.is_none() => {}
-            ScopeKind::SharedOrganisation | ScopeKind::OrphanOrganisation
+                    && self.expected_scope_generation.is_none()
+                    && self.eligibility_loss_epoch.is_none() => {}
+            ScopeKind::SharedOrganisation
                 if self.subject_user_id.is_none()
                     && self
                         .organisation_id
@@ -141,7 +143,20 @@ impl RetentionIntent {
                         .is_some_and(|id| !id.trim().is_empty())
                     && self
                         .expected_scope_generation
-                        .is_some_and(|generation| generation >= 0) => {}
+                        .is_some_and(|generation| generation >= 0)
+                    && (self.eligibility_loss_epoch.is_some_and(|epoch| epoch >= 0)
+                        || (!self.eligibility_episode.starts_with("shared-export:")
+                            && self.eligibility_loss_epoch.is_none())) => {}
+            ScopeKind::OrphanOrganisation
+                if self.subject_user_id.is_none()
+                    && self
+                        .organisation_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty())
+                    && self
+                        .expected_scope_generation
+                        .is_some_and(|generation| generation >= 0)
+                    && self.eligibility_loss_epoch.is_none() => {}
             _ => return Err(RetentionError::InvalidInput("scope ownership")),
         }
         Ok(())
@@ -234,6 +249,7 @@ struct RetentionLease {
     subject_user_id: Option<String>,
     expected_coverage_revision: Option<i64>,
     expected_scope_generation: Option<i64>,
+    eligibility_loss_epoch: Option<i64>,
     organisation_id: Option<String>,
     dry_run: bool,
     deadline_epoch: i64,
@@ -288,9 +304,10 @@ pub async fn enqueue_in_tx(
     let inserted = sqlx::query(
         "INSERT INTO cloud_retention_jobs \
          (job_id, scope_kind, scope_key, subject_user_id, organisation_id, eligibility_episode, \
-          deadline_at, notice_event_key, notice_evidence_at, expected_coverage_revision, expected_scope_generation) \
+          deadline_at, notice_event_key, notice_evidence_at, expected_coverage_revision, expected_scope_generation, eligibility_loss_at) \
          VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),$8,\
-                 CASE WHEN $9::bigint IS NULL THEN NULL ELSE to_timestamp($9) END,$10,$11) \
+                 CASE WHEN $9::bigint IS NULL THEN NULL ELSE to_timestamp($9) END,$10,$11, \
+                 CASE WHEN $12::bigint IS NULL THEN NULL ELSE to_timestamp($12) END) \
          ON CONFLICT (scope_kind, scope_key, eligibility_episode) DO NOTHING",
     )
     .bind(&intent.job_id)
@@ -304,6 +321,7 @@ pub async fn enqueue_in_tx(
     .bind(intent.notice_evidence_epoch)
     .bind(intent.expected_coverage_revision)
     .bind(intent.expected_scope_generation)
+    .bind(intent.eligibility_loss_epoch)
     .execute(&mut **tx)
     .await?
     .rows_affected();
@@ -313,6 +331,7 @@ pub async fn enqueue_in_tx(
     let existing = sqlx::query(
         "SELECT subject_user_id, organisation_id, extract(epoch from deadline_at)::bigint AS deadline_epoch, notice_event_key, \
                 extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch, expected_coverage_revision, expected_scope_generation, \
+                extract(epoch from eligibility_loss_at)::bigint AS eligibility_loss_epoch, \
                 state, dry_run, purge_enabled, job_id \
          FROM cloud_retention_jobs WHERE scope_kind=$1 AND scope_key=$2 \
            AND eligibility_episode=$3 FOR UPDATE",
@@ -330,6 +349,7 @@ pub async fn enqueue_in_tx(
     let notice_evidence_epoch: Option<i64> = existing.try_get("notice_evidence_epoch")?;
     let expected_coverage_revision: Option<i64> = existing.try_get("expected_coverage_revision")?;
     let expected_scope_generation: Option<i64> = existing.try_get("expected_scope_generation")?;
+    let eligibility_loss_epoch: Option<i64> = existing.try_get("eligibility_loss_epoch")?;
     let state: String = existing.try_get("state")?;
     let dry_run: bool = existing.try_get("dry_run")?;
     let purge_enabled: bool = existing.try_get("purge_enabled")?;
@@ -408,6 +428,9 @@ pub async fn enqueue_in_tx(
         .bind(&job_id)
         .execute(&mut **tx)
         .await?;
+    }
+    if eligibility_loss_epoch != intent.eligibility_loss_epoch {
+        return Err(RetentionError::IdentityConflict);
     }
     match (notice_evidence_epoch, intent.notice_evidence_epoch) {
         (Some(stored), Some(incoming)) if stored == incoming => {}
@@ -633,7 +656,7 @@ pub async fn enable_purge(pool: &PgPool, job_id: &str) -> RetentionResult<()> {
     let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE cloud_retention_jobs SET state='ready', purge_enabled=TRUE, dry_run=FALSE, updated_at=now() \
-         WHERE job_id=$1 AND state='dry_run' AND dry_run_completed_at IS NOT NULL \
+         WHERE job_id=$1 AND scope_kind='personal' AND state='dry_run' AND dry_run_completed_at IS NOT NULL \
            AND notice_evidence_at IS NOT NULL AND deadline_at <= now() AND hold_code IS NULL",
     )
     .bind(job_id)
@@ -727,7 +750,8 @@ async fn claim_due(
             (state='leased' AND lease_expires_at <= now() AND \
              (($3 = 'dry_run' AND dry_run=TRUE) OR \
               ($3 = 'purge' AND dry_run=FALSE AND purge_enabled=TRUE)))) \
-         RETURNING scope_kind, subject_user_id, organisation_id, expected_coverage_revision, expected_scope_generation, dry_run, \
+         RETURNING scope_kind, subject_user_id, organisation_id, expected_coverage_revision, expected_scope_generation, \
+                   extract(epoch FROM eligibility_loss_at)::bigint AS eligibility_loss_epoch, dry_run, \
                    extract(epoch from deadline_at)::bigint AS deadline_epoch, \
                    notice_event_key, extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch",
     )
@@ -745,6 +769,7 @@ async fn claim_due(
         organisation_id: row.try_get("organisation_id")?,
         expected_coverage_revision: row.try_get("expected_coverage_revision")?,
         expected_scope_generation: row.try_get("expected_scope_generation")?,
+        eligibility_loss_epoch: row.try_get("eligibility_loss_epoch")?,
         dry_run: row.try_get("dry_run")?,
         deadline_epoch: row.try_get("deadline_epoch")?,
         notice_event_key: row.try_get("notice_event_key")?,
@@ -1622,7 +1647,18 @@ async fn validate_shared_dry_run(
     if transfer_pending {
         return Ok(Some("ownership_transition_pending"));
     }
-    let expected_loss = lease.deadline_epoch - EXPORT_WINDOW_SECONDS;
+    let Some(expected_notice_epoch) = lease.deadline_epoch.checked_sub(EXPORT_WINDOW_SECONDS)
+    else {
+        return Ok(Some("notice_deadline_invalid"));
+    };
+    let Some(expected_loss) = lease.eligibility_loss_epoch else {
+        return Ok(Some("eligibility_boundary_missing"));
+    };
+    if expected_notice_epoch < expected_loss
+        || lease.notice_evidence_epoch != Some(expected_notice_epoch)
+    {
+        return Ok(Some("notice_evidence_missing"));
+    }
     let members = sqlx::query(
         "SELECT user_id, role FROM organization_memberships WHERE org_id=$1 \
          AND role IN ('owner','admin') ORDER BY user_id COLLATE \"C\" LIMIT 257",
@@ -1642,18 +1678,16 @@ async fn validate_shared_dry_run(
            AND membership.user_id=notice.recipient_user_id AND membership.role IN ('owner','admin') \
          WHERE notice.scope_id=$1 AND notice.event_key=$2 AND notice.policy_key='shared-export-deadline-v1' \
            AND notice.kind='shared_export_deadline' AND notice.channel='in_app' \
-           AND notice.due_at=to_timestamp($3) AND notice.status<>'cancelled'",
+           AND notice.due_at=to_timestamp($3) AND notice.created_at<=to_timestamp($3) \
+           AND notice.status<>'cancelled'",
     )
     .bind(org_id)
     .bind(&lease.notice_event_key)
-    .bind(expected_loss)
+    .bind(expected_notice_epoch)
     .fetch_one(&mut **tx)
     .await?;
     if notice_count != members.len() as i64 {
         return Ok(Some("notice_evidence_incomplete"));
-    }
-    if lease.notice_evidence_epoch != Some(expected_loss) {
-        return Ok(Some("notice_evidence_missing"));
     }
     let reachable: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM cloud_verified_contacts contact \
@@ -2142,6 +2176,7 @@ mod tests {
             notice_evidence_epoch: Some(1_899_000_000),
             expected_coverage_revision: Some(4),
             expected_scope_generation: None,
+            eligibility_loss_epoch: None,
         }
     }
 

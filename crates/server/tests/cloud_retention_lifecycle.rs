@@ -67,6 +67,7 @@ fn state(pool: PgPool) -> AppState {
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
         cloud_retention_dry_run_enabled: true,
+        cloud_shared_retention_dry_run_enabled: true,
         cloud_retention_operator_token: Some("0123456789abcdef0123456789abcdef".into()),
     }
 }
@@ -1528,6 +1529,7 @@ async fn bounded_scan_holds_one_conflicted_user_and_continues_to_later_users() {
         notice_evidence_epoch: Some(failed_start),
         expected_coverage_revision: Some(failed_revision),
         expected_scope_generation: None,
+        eligibility_loss_epoch: None,
     };
     assert_eq!(
         retention::enqueue(&pool, &stale_intent)
@@ -1608,7 +1610,9 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         cleanup(&pool, user_id, &organisation_id).await;
         seed_user(&pool, user_id).await;
     }
-    let loss_epoch = now - 60;
+    // The scanner may first discover a real eligibility loss near the end of the 30-day
+    // policy window. That must still produce a full notice window from the queued notice.
+    let loss_epoch = now - EXPORT_WINDOW_SECONDS + 86_400;
     seed_coverage_until(&pool, &owner_id, loss_epoch, now, "shared-owner-expired").await;
     seed_coverage_until(&pool, &admin_id, loss_epoch, now, "shared-admin-expired").await;
     seed_sponsored_coverage_until(&pool, &eligible_id, &eligible_org_id, now + 86_400, now).await;
@@ -1670,6 +1674,17 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     .expect("seed shared machine token");
 
     let mut app = state(pool.clone());
+    // The personal switch alone must not run the organisation-wide scan.
+    app.cloud_shared_retention_dry_run_enabled = false;
+    assert_eq!(
+        sotto_server::cloud_shared_retention::reconcile_once(&app)
+            .await
+            .expect("shared scan stays disabled with only personal retention enabled"),
+        0
+    );
+    // The shared switch works independently of the personal retention switch.
+    app.cloud_retention_dry_run_enabled = false;
+    app.cloud_shared_retention_dry_run_enabled = true;
     scan_shared_organisation(&app, &eligible_org_id).await;
     let premature: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_retention_jobs WHERE organisation_id=$1 AND scope_kind='shared_organisation'",
@@ -1735,15 +1750,32 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         sqlx::query_as(
             "SELECT job_id,state,extract(epoch FROM deadline_at)::bigint, \
                     extract(epoch FROM notice_evidence_at)::bigint \
-             FROM cloud_retention_jobs WHERE organisation_id=$1 AND scope_kind='shared_organisation'",
+             FROM cloud_retention_jobs WHERE organisation_id=$1 AND scope_kind='shared_organisation' \
+               AND state<>'cancelled'",
         )
         .bind(&organisation_id)
         .fetch_one(&pool)
         .await
         .expect("read qualified shared candidate");
     assert_eq!(state_name, "ready");
-    assert_eq!(deadline, loss_epoch + EXPORT_WINDOW_SECONDS);
-    assert_eq!(evidence, Some(loss_epoch));
+    let notice_created_epoch: i64 = sqlx::query_scalar(
+        "SELECT ceil(extract(epoch FROM min(created_at)))::bigint FROM cloud_notice_outbox \
+         WHERE scope_id=$1 AND kind='shared_export_deadline' AND channel='in_app' AND status<>'cancelled'",
+    )
+    .bind(&organisation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read first queued shared notice time");
+    assert_eq!(deadline, notice_created_epoch + EXPORT_WINDOW_SECONDS);
+    assert_eq!(evidence, Some(notice_created_epoch));
+    let raw_loss: i64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM eligibility_loss_at)::bigint FROM cloud_retention_jobs WHERE job_id=$1",
+    )
+    .bind(&job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read original eligibility loss boundary");
+    assert_eq!(raw_loss, loss_epoch);
 
     let notice_count: i64 = sqlx::query_scalar(
         "SELECT count(DISTINCT recipient_user_id) FROM cloud_notice_outbox \
@@ -1806,7 +1838,7 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     // Exercise the actual shared worker against a due, fully evidenced candidate. Move the
     // authoritative coverage boundary and the matching notice evidence together to model a
     // restart after the 30-day window; the worker must validate every scope row and stay dry-run.
-    let dry_run_loss = now - EXPORT_WINDOW_SECONDS - 120;
+    let dry_run_loss = now - 2 * EXPORT_WINDOW_SECONDS - 120;
     for user_id in [&owner_id, &admin_id] {
         publish_authoritative_coverage(
             &pool,
@@ -1823,9 +1855,16 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
         )
         .await;
     }
-    let dry_run_deadline = dry_run_loss + EXPORT_WINDOW_SECONDS;
+    let dry_run_notice_epoch = now - EXPORT_WINDOW_SECONDS - 60;
+    let dry_run_deadline = dry_run_notice_epoch + EXPORT_WINDOW_SECONDS;
+    let generation: i64 =
+        sqlx::query_scalar("SELECT retention_generation FROM organizations WHERE id=$1")
+            .bind(&organisation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read organisation generation for stable notice identity");
     let event_material = format!(
-        "{}:{}:{dry_run_loss}:{dry_run_deadline}",
+        "{}:{}:{dry_run_loss}:{generation}",
         organisation_id.len(),
         organisation_id
     );
@@ -1837,23 +1876,30 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
             .collect::<String>()
     );
     sqlx::query(
-        "UPDATE cloud_notice_outbox SET event_key=$2,due_at=to_timestamp($3),updated_at=now() \
-         WHERE scope_id=$1 AND kind='shared_export_deadline' AND channel='in_app' AND status<>'cancelled'",
+        "UPDATE cloud_notice_outbox SET event_key=$2,due_at=to_timestamp($3),created_at=to_timestamp($3), \
+             payload=jsonb_set(payload,'{deadline_epoch}',to_jsonb($4::bigint)),updated_at=now() \
+         WHERE scope_id=$1 AND event_key=(SELECT notice_event_key FROM cloud_retention_jobs WHERE job_id=$5) \
+           AND kind='shared_export_deadline' AND channel='in_app' AND status<>'cancelled'",
     )
     .bind(&organisation_id)
     .bind(&dry_run_event_key)
-    .bind(dry_run_loss)
+    .bind(dry_run_notice_epoch)
+    .bind(dry_run_deadline)
+    .bind(&refreshed_job_id)
     .execute(&pool)
     .await
     .expect("model the original notice evidence for the elapsed window");
     sqlx::query(
-        "UPDATE cloud_retention_jobs SET deadline_at=to_timestamp($2),notice_event_key=$3, \
-             notice_evidence_at=to_timestamp($4),state='ready',hold_code=NULL \
+        "UPDATE cloud_retention_jobs SET eligibility_episode=$5,eligibility_loss_at=to_timestamp($6), \
+             deadline_at=to_timestamp($2),notice_event_key=$3,notice_evidence_at=to_timestamp($4), \
+             state='ready',hold_code=NULL \
          WHERE job_id=$1 AND scope_kind='shared_organisation'",
     )
     .bind(&refreshed_job_id)
     .bind(dry_run_deadline)
     .bind(&dry_run_event_key)
+    .bind(dry_run_notice_epoch)
+    .bind(format!("shared-export:{dry_run_loss}:g{generation}"))
     .bind(dry_run_loss)
     .execute(&pool)
     .await
@@ -1885,6 +1931,19 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     assert_eq!(run.state.as_str(), "dry_run");
     assert_eq!(run.processed_items, 5);
     assert_eq!(run.held_items, 0);
+    assert!(matches!(
+        retention::enable_purge(&pool, &refreshed_job_id).await,
+        Err(retention::RetentionError::Held(
+            "purge prerequisites are not met"
+        ))
+    ));
+    let purge_enabled: bool =
+        sqlx::query_scalar("SELECT purge_enabled FROM cloud_retention_jobs WHERE job_id=$1")
+            .bind(&refreshed_job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("confirm shared dry run cannot enable purge");
+    assert!(!purge_enabled);
     let dry_run_scope_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND state='dry_run'",
     )
@@ -1916,7 +1975,7 @@ async fn shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_sc
     .expect("confirm shared dry run preserved every resource");
     assert!(resources_remain_after_run);
 
-    app.cloud_retention_dry_run_enabled = false;
+    app.cloud_shared_retention_dry_run_enabled = false;
     sqlx::query("DELETE FROM cloud_notice_outbox WHERE scope_id=$1")
         .bind(&organisation_id)
         .execute(&pool)

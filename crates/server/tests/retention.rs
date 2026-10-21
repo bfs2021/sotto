@@ -101,6 +101,7 @@ fn intent(job_id: &str, user_id: &str) -> RetentionIntent {
         notice_evidence_epoch: Some(1),
         expected_coverage_revision: None,
         expected_scope_generation: None,
+        eligibility_loss_epoch: None,
     }
 }
 

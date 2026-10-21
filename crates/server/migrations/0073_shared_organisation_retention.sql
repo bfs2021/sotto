@@ -8,10 +8,16 @@ ALTER TABLE organizations
 ALTER TABLE cloud_retention_jobs
     ADD COLUMN expected_scope_generation BIGINT
         CHECK (expected_scope_generation IS NULL OR expected_scope_generation >= 0),
+    ADD COLUMN eligibility_loss_at TIMESTAMPTZ,
     ADD CONSTRAINT cloud_retention_jobs_scope_generation_check CHECK (
         (scope_kind = 'personal' AND expected_scope_generation IS NULL)
         OR (scope_kind IN ('shared_organisation', 'orphan_organisation')
             AND expected_scope_generation IS NOT NULL)
+    ),
+    ADD CONSTRAINT cloud_retention_jobs_eligibility_loss_check CHECK (
+        (scope_kind = 'shared_organisation' AND
+            (eligibility_episode NOT LIKE 'shared-export:%' OR eligibility_loss_at IS NOT NULL))
+        OR (scope_kind <> 'shared_organisation' AND eligibility_loss_at IS NULL)
     );
 
 ALTER TABLE cloud_retention_scope_items

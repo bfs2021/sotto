@@ -264,6 +264,7 @@ async fn reconcile_expiry_candidate(
         notice_evidence_epoch,
         expected_coverage_revision: Some(revision),
         expected_scope_generation: None,
+        eligibility_loss_epoch: None,
     };
     if retention::enqueue_in_tx(&mut tx, &intent)
         .await
@@ -556,38 +557,45 @@ fn epoch_now() -> i64 {
 
 /// Start the default-off dry-run reconciler. It has no provider and no purge-mode call site.
 pub fn spawn(state: AppState) {
-    if !state.cloud_retention_dry_run_enabled || state.deployment_mode != DeploymentMode::Cloud {
+    if (!state.cloud_retention_dry_run_enabled && !state.cloud_shared_retention_dry_run_enabled)
+        || state.deployment_mode != DeploymentMode::Cloud
+    {
         return;
     }
     tokio::spawn(async move {
         let worker_id = format!("retention-worker:{}", Uuid::new_v4());
         loop {
-            if reconcile_once(&state).await.is_err() {
+            if state.cloud_retention_dry_run_enabled && reconcile_once(&state).await.is_err() {
                 eprintln!("cloud retention candidate reconciliation failed");
             }
-            if crate::cloud_shared_retention::reconcile_once(&state)
-                .await
-                .is_err()
+            if state.cloud_shared_retention_dry_run_enabled
+                && crate::cloud_shared_retention::reconcile_once(&state)
+                    .await
+                    .is_err()
             {
                 eprintln!("cloud shared retention candidate reconciliation failed");
             }
-            for _ in 0..128 {
-                match retention::run_dry_run_once(&state.pool, &worker_id).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {
-                        eprintln!("cloud retention dry run failed");
-                        break;
+            if state.cloud_retention_dry_run_enabled {
+                for _ in 0..128 {
+                    match retention::run_dry_run_once(&state.pool, &worker_id).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            eprintln!("cloud retention dry run failed");
+                            break;
+                        }
                     }
                 }
             }
-            for _ in 0..128 {
-                match retention::run_shared_dry_run_once(&state.pool, &worker_id).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {
-                        eprintln!("cloud shared retention dry run failed");
-                        break;
+            if state.cloud_shared_retention_dry_run_enabled {
+                for _ in 0..128 {
+                    match retention::run_shared_dry_run_once(&state.pool, &worker_id).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            eprintln!("cloud shared retention dry run failed");
+                            break;
+                        }
                     }
                 }
             }

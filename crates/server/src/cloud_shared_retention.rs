@@ -1,7 +1,7 @@
 //! Conservative organisation-wide retention candidate preparation.
 //!
 //! The policy population is the current set of owners and admins. A shared export window starts
-//! at the latest proven loss of their Cloud eligibility and lasts thirty days. Missing history,
+//! no earlier than the first durable notice and lasts thirty days. Missing history,
 //! unavailable authority, an orphaned organisation, an in-flight ownership change, or no verified
 //! contact produces held work. This module only snapshots and dry-runs; it cannot purge data.
 
@@ -23,7 +23,9 @@ const MAX_SCOPE_ITEMS: usize = 4_096;
 const SHARED_RETENTION_POLICY: &str = "shared-export-deadline-v1";
 
 pub async fn reconcile_once(state: &AppState) -> Result<usize> {
-    if !state.cloud_retention_dry_run_enabled || state.deployment_mode != DeploymentMode::Cloud {
+    if !state.cloud_shared_retention_dry_run_enabled
+        || state.deployment_mode != DeploymentMode::Cloud
+    {
         return Ok(0);
     }
     let owner = format!("shared-retention-scan:{}", Uuid::new_v4());
@@ -237,20 +239,7 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
         }
     }
     let loss_epoch = loss_epochs.into_iter().max().unwrap_or(now);
-    let Some(deadline) = loss_epoch.checked_add(EXPORT_WINDOW_SECONDS) else {
-        create_held_episode(
-            &mut tx,
-            organisation_id,
-            generation,
-            now,
-            "shared_deadline_invalid",
-            &members,
-        )
-        .await?;
-        tx.commit().await?;
-        return Ok(());
-    };
-    if loss_epoch <= 0 || deadline <= 0 {
+    if loss_epoch <= 0 {
         create_held_episode(
             &mut tx,
             organisation_id,
@@ -263,7 +252,7 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
         tx.commit().await?;
         return Ok(());
     }
-    let event_key = shared_event_key(organisation_id, loss_epoch, deadline);
+    let event_key = shared_event_key(organisation_id, loss_epoch, generation);
     let contact_available: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM cloud_verified_contacts c \
          JOIN organization_memberships m ON m.user_id=c.user_id \
@@ -272,6 +261,65 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
     .bind(organisation_id)
     .fetch_one(&mut *tx)
     .await?;
+    let prior_notice_epoch: Option<i64> = sqlx::query_scalar(
+        "SELECT ceil(extract(epoch FROM min(created_at)))::bigint FROM cloud_notice_outbox \
+         WHERE scope_id=$1 AND event_key=$2 AND policy_key=$3 \
+           AND kind='shared_export_deadline' AND channel='in_app' AND status<>'cancelled'",
+    )
+    .bind(organisation_id)
+    .bind(&event_key)
+    .bind(SHARED_RETENTION_POLICY)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !contact_available && prior_notice_epoch.is_none() {
+        create_held_episode(
+            &mut tx,
+            organisation_id,
+            generation,
+            now,
+            "no_verified_owner_contact",
+            &members,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    let queued_epoch = if let Some(epoch) = prior_notice_epoch {
+        epoch
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT ceil(extract(epoch FROM transaction_timestamp()))::bigint",
+        )
+        .fetch_one(&mut *tx)
+        .await?
+        .max(loss_epoch)
+    };
+    let Some(deadline) = queued_epoch.checked_add(EXPORT_WINDOW_SECONDS) else {
+        create_held_episode(
+            &mut tx,
+            organisation_id,
+            generation,
+            now,
+            "shared_deadline_invalid",
+            &members,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    };
+    if deadline <= 0 {
+        create_held_episode(
+            &mut tx,
+            organisation_id,
+            generation,
+            now,
+            "shared_deadline_invalid",
+            &members,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
     if contact_available && now <= deadline {
         for user_id in &members {
             notifications::enqueue_shared_export_deadline_in_tx(
@@ -279,7 +327,7 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
                 user_id,
                 organisation_id,
                 &event_key,
-                loss_epoch,
+                queued_epoch,
                 deadline,
             )
             .await
@@ -297,7 +345,7 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
     .fetch_one(&mut *tx)
     .await?;
     let notices_complete = notice_count == members.len() as i64;
-    let episode = format!("shared-export:{loss_epoch}:{deadline}:g{generation}");
+    let episode = format!("shared-export:{loss_epoch}:g{generation}");
     let stored_evidence: Option<i64> = sqlx::query_scalar(
         "SELECT extract(epoch FROM notice_evidence_at)::bigint FROM cloud_retention_jobs \
          WHERE scope_kind='shared_organisation' AND scope_key=$1 AND eligibility_episode=$2",
@@ -317,9 +365,8 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
     .await?
     .flatten();
     let refresh_scope = previous_generation != Some(generation);
-    let evidence_epoch = stored_evidence.or_else(|| {
-        (contact_available && notices_complete && now <= deadline).then_some(loss_epoch)
-    });
+    let evidence_epoch =
+        stored_evidence.or_else(|| (notices_complete && now <= deadline).then_some(queued_epoch));
     cancel_other_episodes(&mut tx, organisation_id, &episode).await?;
     let intent = RetentionIntent {
         job_id: retention::new_job_id(),
@@ -333,6 +380,7 @@ async fn reconcile_organisation(state: &AppState, organisation_id: &str) -> Resu
         notice_evidence_epoch: evidence_epoch,
         expected_coverage_revision: None,
         expected_scope_generation: Some(generation),
+        eligibility_loss_epoch: Some(loss_epoch),
     };
     let outcome = retention::enqueue_in_tx(&mut tx, &intent)
         .await
@@ -598,6 +646,7 @@ fn held_intent(
         notice_evidence_epoch: None,
         expected_coverage_revision: None,
         expected_scope_generation: Some(generation),
+        eligibility_loss_epoch: None,
     }
 }
 
@@ -635,11 +684,11 @@ async fn hold_existing(pool: &PgPool, org_id: &str, reason: &str) -> Result<()> 
     Ok(())
 }
 
-fn shared_event_key(org_id: &str, loss_epoch: i64, deadline: i64) -> String {
+fn shared_event_key(org_id: &str, loss_epoch: i64, generation: i64) -> String {
     format!(
         "cloud-shared-export:{}",
         fingerprint(&format!(
-            "{}:{}:{loss_epoch}:{deadline}",
+            "{}:{}:{loss_epoch}:{generation}",
             org_id.len(),
             org_id
         ))
