@@ -158,26 +158,6 @@ pub struct ScopeItem {
     pub expected_revision: Option<i64>,
 }
 
-/// Classify a share against the creator's retention deadline.
-///
-/// Paid and legacy links end at that deadline under the accepted retention policy. An
-/// independently valid free link keeps its original finite promise; if that promise extends past
-/// the creator's deadline, the whole candidate is held rather than shortening the link early.
-pub(crate) fn share_retention_hold(
-    share_class: &str,
-    expires_at_epoch: Option<i64>,
-    deadline_epoch: i64,
-) -> Option<&'static str> {
-    if !matches!(share_class, "free" | "paid" | "legacy") {
-        Some("share_lifetime_unproven")
-    } else if share_class == "free" && expires_at_epoch.is_none_or(|expiry| expiry > deadline_epoch)
-    {
-        Some("share_promise_exceeds_deadline")
-    } else {
-        None
-    }
-}
-
 impl ScopeItem {
     pub fn validate(&self) -> RetentionResult<()> {
         bounded(&self.job_id, MAX_KEY, "job_id")?;
@@ -2175,30 +2155,6 @@ mod tests {
             invalid.validate(),
             Err(RetentionError::InvalidInput("notice_evidence_epoch"))
         ));
-    }
-
-    #[test]
-    fn share_retention_preserves_free_promises_and_ends_paid_legacy_at_deadline() {
-        let deadline = 1_900_000_000;
-        assert_eq!(share_retention_hold("paid", None, deadline), None);
-        assert_eq!(share_retention_hold("legacy", None, deadline), None);
-        assert_eq!(
-            share_retention_hold("paid", Some(deadline + 1), deadline),
-            None
-        );
-        assert_eq!(share_retention_hold("free", Some(deadline), deadline), None);
-        assert_eq!(
-            share_retention_hold("free", Some(deadline + 1), deadline),
-            Some("share_promise_exceeds_deadline")
-        );
-        assert_eq!(
-            share_retention_hold("free", None, deadline),
-            Some("share_promise_exceeds_deadline")
-        );
-        assert_eq!(
-            share_retention_hold("unknown", None, deadline),
-            Some("share_lifetime_unproven")
-        );
     }
 
     #[test]

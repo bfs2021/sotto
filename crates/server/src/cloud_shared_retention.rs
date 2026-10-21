@@ -579,7 +579,7 @@ async fn create_held_episode(
 fn held_intent(
     org_id: &str,
     generation: i64,
-    now: i64,
+    _now: i64,
     kind: ScopeKind,
     episode: &str,
     event: &str,
@@ -591,7 +591,9 @@ fn held_intent(
         subject_user_id: None,
         organisation_id: Some(org_id.into()),
         eligibility_episode: episode.into(),
-        deadline_epoch: now.max(1),
+        // Held episodes have no automatic deadline. Keep the required database placeholder
+        // stable so repeated scans compare as the same idempotent episode.
+        deadline_epoch: 1,
         notice_event_key: event.into(),
         notice_evidence_epoch: None,
         expected_coverage_revision: None,
