@@ -1140,8 +1140,8 @@ async fn personal_retention_purge_requires_signed_review_and_preserves_the_user(
     let suffix = uuid::Uuid::new_v4();
     let user_id = format!("retention-purge-user-{suffix}");
     let project_id = format!("retention-purge-project-{suffix}");
-    let environment_id = format!("retention-purge-environment-{suffix}");
-    let token_id = format!("retention-purge-token-{suffix}");
+    let environment_prefix = format!("retention-purge-environment-{suffix}-");
+    let token_prefix = format!("retention-purge-token-{suffix}-");
     let organisation_id = format!("unused-retention-purge-org-{suffix}");
     let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(&pool)
@@ -1156,44 +1156,38 @@ async fn personal_retention_purge_requires_signed_review_and_preserves_the_user(
         .await
         .expect("seed personal purge project");
     sqlx::query(
-        "INSERT INTO projects(id,owner_id,enc_name) \
-         SELECT 'retention-purge-extra-' || $1 || '-' || n::text,$2,decode('11','hex') \
-         FROM generate_series(1,64) AS n",
-    )
-    .bind(suffix.to_string())
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("seed projects across two bounded purge batches");
-    sqlx::query(
         "INSERT INTO environments(id,project_id,enc_name,revision) \
-         VALUES($1,$2,decode('12','hex'),1)",
+         SELECT $1 || n::text,$2,decode('12','hex'),1 \
+         FROM generate_series(1,65) AS n",
     )
-    .bind(&environment_id)
+    .bind(&environment_prefix)
     .bind(&project_id)
     .execute(&pool)
     .await
-    .expect("seed personal purge environment");
+    .expect("seed 65 personal purge environments");
     sqlx::query(
         "INSERT INTO environment_grants(env_id,user_id,enc_vault_key) \
-         VALUES($1,$2,decode('13','hex'))",
+         SELECT $1 || n::text,$2,decode('13','hex') \
+         FROM generate_series(1,65) AS n",
     )
-    .bind(&environment_id)
+    .bind(&environment_prefix)
     .bind(&user_id)
     .execute(&pool)
     .await
-    .expect("seed personal environment grant");
+    .expect("seed owner keys for all purge environments");
     sqlx::query(
         "INSERT INTO machine_tokens(id,env_id,name,token_hash,public_key,enc_vault_key,created_by,expires_at,beneficiary_id,beneficiary_status) \
-         VALUES($1,$2,'retention-test',$3,decode('14','hex'),decode('15','hex'),$4,now()+interval '7 days',$4,'verified')",
+         SELECT $1 || n::text,$2 || n::text,'retention-test',\
+                decode(md5($1 || n::text),'hex'),decode('14','hex'),decode('15','hex'),\
+                $3,now()+interval '7 days',$3,'verified' \
+         FROM generate_series(1,65) AS n",
     )
-    .bind(&token_id)
-    .bind(&environment_id)
-    .bind(suffix.as_bytes().to_vec())
+    .bind(&token_prefix)
+    .bind(&environment_prefix)
     .bind(&user_id)
     .execute(&pool)
     .await
-    .expect("seed personal machine token");
+    .expect("seed machine tokens for all purge environments");
     let (notice_start, deadline) = seed_expired_projection(&pool, &user_id, now).await;
     seed_notice(&pool, &user_id, notice_start, deadline, notice_start - 60).await;
     sqlx::query(
@@ -1216,16 +1210,16 @@ async fn personal_retention_purge_requires_signed_review_and_preserves_the_user(
     .fetch_one(&pool)
     .await
     .expect("load personal retention job");
-    let first_dry_run = retention::run_dry_run_once(&pool, "personal-retention-dry-run")
-        .await
-        .expect("run first personal dry-run batch")
-        .expect("claim first personal dry-run batch");
-    assert_eq!(first_dry_run.state.as_str(), "ready");
-    let final_dry_run = retention::run_dry_run_once(&pool, "personal-retention-dry-run")
-        .await
-        .expect("run final personal dry-run batch")
-        .expect("claim final personal dry-run batch");
-    assert_eq!(final_dry_run.state.as_str(), "dry_run");
+    loop {
+        let run = retention::run_dry_run_once(&pool, "personal-retention-dry-run")
+            .await
+            .expect("run personal dry-run batch")
+            .expect("claim personal dry-run batch");
+        if run.state.as_str() == "dry_run" {
+            break;
+        }
+        assert_eq!(run.state.as_str(), "ready");
+    }
     let scope_fingerprint = retention::review_scope_fingerprint(&pool, &job_id)
         .await
         .expect("fingerprint exact personal scope");
@@ -1274,7 +1268,19 @@ async fn personal_retention_purge_requires_signed_review_and_preserves_the_user(
             .expect("execute approved personal purge")
             .expect("claim approved personal purge");
     assert_eq!(purge.state.as_str(), "held");
-    assert_eq!(purge.processed_items, 64);
+    assert!(purge.processed_items > 64);
+    let remaining_environment_keys: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),count(*) FILTER (WHERE \
+             NOT EXISTS (SELECT 1 FROM environment_grants g WHERE g.env_id=e.id AND g.user_id=$2) \
+             OR NOT EXISTS (SELECT 1 FROM machine_tokens m WHERE m.env_id=e.id)) \
+         FROM environments e WHERE e.id LIKE $1 || '%'",
+    )
+    .bind(&environment_prefix)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("check every surviving environment still has its key material");
+    assert_eq!(remaining_environment_keys, (1, 0));
     let first_batch: (i64, i64, String) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM cloud_retention_receipts WHERE job_id=$1), \
                 (SELECT count(*) FROM cloud_retention_tombstone_journal WHERE job_id=$1), \
@@ -1285,7 +1291,9 @@ async fn personal_retention_purge_requires_signed_review_and_preserves_the_user(
     .fetch_one(&pool)
     .await
     .expect("inspect first bounded purge batch");
-    assert_eq!(first_batch, (64, 64, "stale".into()));
+    assert_eq!(first_batch.0, purge.processed_items as i64);
+    assert_eq!(first_batch.1, purge.processed_items as i64);
+    assert_eq!(first_batch.2, "stale");
     assert!(matches!(
         retention::run_approved_purge_once(&pool, "personal-retention-purge-worker", &release_sha)
             .await,
@@ -1342,13 +1350,13 @@ async fn personal_retention_purge_requires_signed_review_and_preserves_the_user(
     assert!(users_remain);
     let resources_remain: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1) OR \
-                EXISTS(SELECT 1 FROM environments WHERE id=$2) OR \
-                EXISTS(SELECT 1 FROM environment_grants WHERE env_id=$2) OR \
-                EXISTS(SELECT 1 FROM machine_tokens WHERE id=$3)",
+                EXISTS(SELECT 1 FROM environments WHERE id LIKE $2 || '%') OR \
+                EXISTS(SELECT 1 FROM environment_grants WHERE env_id LIKE $2 || '%') OR \
+                EXISTS(SELECT 1 FROM machine_tokens WHERE id LIKE $3 || '%')",
     )
     .bind(&project_id)
-    .bind(&environment_id)
-    .bind(&token_id)
+    .bind(&environment_prefix)
+    .bind(&token_prefix)
     .fetch_one(&pool)
     .await
     .expect("verify personal scope children and parents were deleted");

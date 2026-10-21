@@ -1744,18 +1744,52 @@ async fn run_once_with_scope(
     } else {
         "dry_run"
     };
-    let items = sqlx::query(
+    // A purge batch is bounded by independent deletion units, not rows. An environment and
+    // every reviewed grant/token beneath it must commit together: if the job stops between
+    // batches, no surviving environment may have lost its decryption key. A large unit may
+    // therefore exceed BATCH_SIZE rows; the total scope is still capped by MAX_SCOPE_ITEMS.
+    let batch_query = if mode == RetentionMode::Purge {
+        "WITH units AS ( \
+             SELECT CASE \
+                      WHEN resource_kind='environment' THEN 'environment:' || resource_id \
+                      WHEN resource_kind='grant' THEN 'environment:' || (resource_id::jsonb->>0) \
+                      WHEN resource_kind='machine_token' THEN 'environment:' || (resource_id::jsonb->>1) \
+                      ELSE resource_kind || ':' || resource_id \
+                    END AS unit_key, \
+                    min(CASE \
+                      WHEN resource_kind IN ('environment','grant','machine_token') THEN 0 \
+                      WHEN resource_kind='share' THEN 1 ELSE 2 END) AS unit_order \
+             FROM cloud_retention_scope_items WHERE job_id=$1 AND state=$2 \
+             GROUP BY 1 \
+         ), selected_units AS ( \
+             SELECT unit_key FROM units ORDER BY unit_order,unit_key COLLATE \"C\" LIMIT $3 \
+         ) \
+         SELECT item.resource_kind,item.resource_id,item.ownership_kind, \
+                item.expected_created_at,item.expected_revision \
+         FROM cloud_retention_scope_items item \
+         JOIN selected_units unit ON unit.unit_key = CASE \
+              WHEN item.resource_kind='environment' THEN 'environment:' || item.resource_id \
+              WHEN item.resource_kind='grant' THEN 'environment:' || (item.resource_id::jsonb->>0) \
+              WHEN item.resource_kind='machine_token' THEN 'environment:' || (item.resource_id::jsonb->>1) \
+              ELSE item.resource_kind || ':' || item.resource_id END \
+         WHERE item.job_id=$1 AND item.state=$2 \
+         ORDER BY CASE item.resource_kind WHEN 'grant' THEN 0 WHEN 'machine_token' THEN 1 \
+                  WHEN 'environment' THEN 2 WHEN 'share' THEN 3 WHEN 'project' THEN 4 ELSE 5 END, \
+                  item.resource_kind COLLATE \"C\",item.resource_id COLLATE \"C\" \
+         FOR UPDATE OF item"
+    } else {
         "SELECT resource_kind, resource_id, ownership_kind, expected_created_at, expected_revision \
          FROM cloud_retention_scope_items WHERE job_id=$1 AND state=$2 \
          ORDER BY CASE resource_kind WHEN 'grant' THEN 0 WHEN 'machine_token' THEN 1 \
                   WHEN 'environment' THEN 2 WHEN 'share' THEN 3 WHEN 'project' THEN 4 ELSE 5 END, \
-                  resource_kind COLLATE \"C\",resource_id COLLATE \"C\" LIMIT $3 FOR UPDATE",
-    )
-    .bind(&lease.job_id)
-    .bind(item_state)
-    .bind(BATCH_SIZE)
-    .fetch_all(&mut *tx)
-    .await?;
+                  resource_kind COLLATE \"C\",resource_id COLLATE \"C\" LIMIT $3 FOR UPDATE"
+    };
+    let items = sqlx::query(batch_query)
+        .bind(&lease.job_id)
+        .bind(item_state)
+        .bind(BATCH_SIZE)
+        .fetch_all(&mut *tx)
+        .await?;
     if mode == RetentionMode::DryRun && lease.scope_kind == ScopeKind::SharedOrganisation.as_str() {
         if let Some(reason) = validate_shared_dry_run(&mut tx, &lease, None).await? {
             set_job_hold(&mut tx, &lease, reason).await?;
