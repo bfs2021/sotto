@@ -187,6 +187,30 @@ fresh restore rehearsal and approval. The destructive operator label is audit te
 authenticated individual; use the credentials only through the protected operator channel and do
 not place them in logs or support messages.
 
+The signed request is produced offline from the matching backup and sidecar after restoring them
+to a dedicated local database. Name that database `retention_restore_<name>`, export its URL as
+`SOTTO_RETENTION_REHEARSAL_DATABASE_URL` (never pass it as a command-line argument), and materialise
+the evidence HMAC key from the secret store in a file readable only by the operator. From the exact
+release checkout, run:
+
+```sh
+scripts/retention-restore-rehearsal \
+  --backup ./sotto-<stamp>.dump \
+  --journal ./sotto-<stamp>.tombstones.jsonl \
+  --evidence-key-file ./retention-evidence.key \
+  --release-sha "$(git rev-parse HEAD)" \
+  --operator "<operator label>" \
+  --output ./restore-evidence-request.json
+```
+
+The command requires a local scratch database and key file mode `0600`; it validates the restored
+schema before and after replay, runs the matching sidecar twice, checks that the second replay is a
+no-op, and tests stale-incarnation guards against temporary rows in the scratch database. It writes
+the exact JSON body for `/ops/cloud/retention/purge/restore-evidence` with mode `0600`. Review and
+submit that body through the protected operator channel. The script does not contact the live
+service or register evidence itself; the evidence key must match the running build's configured
+key, and the release SHA must match that build.
+
 On a 1 GB host, give the kernel some headroom before the first start:
 
 ```sh

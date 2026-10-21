@@ -157,6 +157,11 @@ class Journal(unittest.TestCase):
         self.assertLess(sql.index("DELETE FROM environment_grants"), sql.index("DELETE FROM projects"))
         self.assertLess(sql.index("DELETE FROM machine_tokens"), sql.index("DELETE FROM projects"))
         self.assertIn("p.org_id = r.owner_id", sql)
+        self.assertIn("g.created_at", sql)
+        self.assertIn("m.created_at", sql)
+        self.assertIn("e.revision = r.expected_revision", sql)
+        self.assertIn("p.owner_id = r.owner_id", sql)
+        self.assertIn("p.created_at", sql)
 
     def test_oversized_lines_are_rejected(self):
         path = self.write([entry(tombstone={"padding": "x" * replay.MAX_LINE_BYTES})])
