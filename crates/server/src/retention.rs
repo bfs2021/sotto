@@ -630,18 +630,27 @@ pub async fn apply_operator_action(
 
 pub async fn enable_purge(pool: &PgPool, job_id: &str) -> RetentionResult<()> {
     bounded(job_id, MAX_KEY, "job_id")?;
+    let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE cloud_retention_jobs SET state='ready', purge_enabled=TRUE, dry_run=FALSE, updated_at=now() \
          WHERE job_id=$1 AND state='dry_run' AND dry_run_completed_at IS NOT NULL \
            AND notice_evidence_at IS NOT NULL AND deadline_at <= now() AND hold_code IS NULL",
     )
     .bind(job_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected != 1 {
         return Err(RetentionError::Held("purge prerequisites are not met"));
     }
+    sqlx::query(
+        "UPDATE cloud_retention_scope_items SET state='planned',updated_at=now() \
+         WHERE job_id=$1 AND state='dry_run'",
+    )
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
