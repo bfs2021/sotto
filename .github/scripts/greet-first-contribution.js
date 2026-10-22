@@ -11,8 +11,9 @@
  * Authors are identified by account id, never by login, because a login can
  * change between the event and the run (see run()).
  * A bot greeting already on the pull request suppresses a second post, so
- * rerunning the workflow is safe. Any API error propagates and fails the check
- * rather than being mistaken for a new contributor.
+ * rerunning the workflow is safe. Any API error or incomplete history response
+ * propagates and fails the check rather than being mistaken for a new
+ * contributor.
  *
  * Plain CommonJS so actions/github-script can require() it from the checked
  * out base branch - under pull_request_target that is always
@@ -24,6 +25,8 @@ const MAINTAINER_ASSOCIATIONS = new Set([
   "MEMBER",
   "COLLABORATOR",
 ]);
+
+const HISTORY_ATTEMPTS = 3;
 
 /** The issues API returns pull requests too; this field is the divider. */
 function isPullRequestItem(item) {
@@ -41,6 +44,20 @@ function hasEarlierContribution(history, authorId, number) {
       item.user.id === authorId &&
       isPullRequestItem(item) &&
       item.number < number
+  );
+}
+
+/**
+ * True when `history` contains the opened pull request itself, proving the
+ * creator-filtered issues query did not silently return an empty result.
+ */
+function hasCurrentPullRequest(history, authorId, number) {
+  return history.some(
+    (item) =>
+      item.user &&
+      item.user.id === authorId &&
+      isPullRequestItem(item) &&
+      item.number === number
   );
 }
 
@@ -99,14 +116,30 @@ async function run({ github, context, core, prMessage }) {
   // creator narrows the scan to this author's items; state: all counts open,
   // closed, and merged alike. paginate follows every page, and the id check
   // inside hasEarlierContribution keeps other accounts out even if the API
-  // ever returns them.
-  const history = await github.paginate(github.rest.issues.listForRepo, {
-    owner,
-    repo,
-    state: "all",
-    creator: author,
-    per_page: 100,
-  });
+  // ever returns them. GitHub's creator filter can intermittently answer 200 OK
+  // with [] (PR #695), so retry until the response includes either an earlier
+  // pull request or the current pull request itself.
+  let history = [];
+  for (let attempt = 1; attempt <= HISTORY_ATTEMPTS; attempt += 1) {
+    history = await github.paginate(github.rest.issues.listForRepo, {
+      owner,
+      repo,
+      state: "all",
+      creator: author,
+      per_page: 100,
+    });
+    if (
+      hasEarlierContribution(history, authorId, number) ||
+      hasCurrentPullRequest(history, authorId, number)
+    ) {
+      break;
+    }
+    if (attempt === HISTORY_ATTEMPTS) {
+      throw new Error(
+        `History query for ${author} did not include pull request #${number}; refusing to assume a first contribution.`
+      );
+    }
+  }
 
   if (hasEarlierContribution(history, authorId, number)) {
     core.info(
@@ -144,4 +177,9 @@ async function run({ github, context, core, prMessage }) {
   return { greeted: true, reason: "first-pr" };
 }
 
-module.exports = { run, hasEarlierContribution, hasGreeting };
+module.exports = {
+  run,
+  hasEarlierContribution,
+  hasCurrentPullRequest,
+  hasGreeting,
+};

@@ -12,6 +12,7 @@ const test = require("node:test");
 const {
   run,
   hasEarlierContribution,
+  hasCurrentPullRequest,
   hasGreeting,
 } = require("./greet-first-contribution.js");
 
@@ -61,7 +62,9 @@ function userComment(body) {
  * GET /user/{account_id}; unlisted ids resolve through ACCOUNT_IDS. With
  * `filterByCreator`, listForRepo filters the way GitHub does: logins match
  * case-insensitively, and a login no account holds any more returns an empty
- * list rather than an error.
+ * list rather than an error. `emptyHistoryAttempts` simulates GitHub's
+ * intermittent 200 OK with `[]` on creator-filtered issue queries before the
+ * real history appears.
  */
 function makeGithub({
   history = [],
@@ -69,6 +72,7 @@ function makeGithub({
   failures = {},
   logins = {},
   filterByCreator = false,
+  emptyHistoryAttempts = 0,
 } = {}) {
   const calls = {
     getUser: [],
@@ -76,12 +80,17 @@ function makeGithub({
     listComments: [],
     createComment: [],
   };
+  let remainingEmptyAttempts = emptyHistoryAttempts;
   const page = (items, params) =>
     items.slice(
       (params.page - 1) * params.per_page,
       params.page * params.per_page
     );
   const listForRepo = async (params) => {
+    if (remainingEmptyAttempts > 0) {
+      remainingEmptyAttempts -= 1;
+      return [];
+    }
     const creator = params.creator.toLowerCase();
     const items = filterByCreator
       ? history.filter((item) => item.user.login.toLowerCase() === creator)
@@ -151,9 +160,10 @@ function args(overrides) {
 }
 
 test("a new author's first pull request is greeted", async () => {
-  const { github, calls } = makeGithub();
+  const current = pr(50, "newbie");
+  const { github, calls } = makeGithub({ history: [current] });
   const result = await run(
-    args({ github, context: makeContext(pr(50, "newbie"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, true);
   assert.equal(result.reason, "first-pr");
@@ -165,14 +175,16 @@ test("a new author's first pull request is greeted", async () => {
 test("a returning pull request author is not greeted, even with no issues", async () => {
   // The regression this replaces: upstream OR'd the first-issue check in, so
   // an author with earlier pull requests but no issues was greeted every time.
+  const current = pr(214, "alice");
   const { github, calls } = makeGithub({
     history: [
+      current,
       pr(10, "alice"),
       pr(42, "alice", { pull_request: { merged_at: "2026-09-01T00:00:00Z" } }),
     ],
   });
   const result = await run(
-    args({ github, context: makeContext(pr(214, "alice"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, false);
   assert.equal(result.reason, "returning-contributor");
@@ -180,11 +192,16 @@ test("a returning pull request author is not greeted, even with no issues", asyn
 });
 
 test("an author with only issues is greeted on their first pull request", async () => {
+  const current = pr(50, "alice");
   const { github, calls } = makeGithub({
-    history: [issue(3, "alice"), issue(9, "alice", { state: "closed" })],
+    history: [
+      current,
+      issue(3, "alice"),
+      issue(9, "alice", { state: "closed" }),
+    ],
   });
   const result = await run(
-    args({ github, context: makeContext(pr(50, "alice"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, true);
   assert.equal(calls.createComment[0].body, PR_MESSAGE);
@@ -204,8 +221,8 @@ test("issues are never greeted", async () => {
 
 test("owners, members, and collaborators are never greeted", async () => {
   for (const author_association of ["OWNER", "MEMBER", "COLLABORATOR"]) {
-    const { github, calls } = makeGithub();
     const item = pr(695, "Maxerns", { author_association });
+    const { github, calls } = makeGithub({ history: [item] });
     const result = await run(
       args({ github, context: makeContext(item, true) })
     );
@@ -218,20 +235,24 @@ test("owners, members, and collaborators are never greeted", async () => {
 });
 
 test("items numbered after the current one do not block the greeting", async () => {
-  const { github, calls } = makeGithub({ history: [pr(99, "alice")] });
+  const current = pr(50, "alice");
+  const { github, calls } = makeGithub({
+    history: [pr(99, "alice"), current],
+  });
   const result = await run(
-    args({ github, context: makeContext(pr(50, "alice"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, true);
   assert.equal(calls.createComment.length, 1);
 });
 
 test("another author's history does not affect eligibility", async () => {
+  const current = pr(50, "alice");
   const { github, calls } = makeGithub({
-    history: [pr(1, "bob"), issue(2, "carol")],
+    history: [current, pr(1, "bob"), issue(2, "carol")],
   });
   const result = await run(
-    args({ github, context: makeContext(pr(50, "alice"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, true);
   assert.equal(calls.createComment.length, 1);
@@ -240,21 +261,24 @@ test("another author's history does not affect eligibility", async () => {
 test("history beyond the first page is still searched", async () => {
   // 104 issues push an earlier pull request onto the second page; reading
   // only page one would wrongly greet this returning contributor.
-  const history = Array.from({ length: 104 }, (_, i) =>
-    issue(i + 1, "alice")
-  );
-  history.push(pr(150, "alice"));
+  const current = pr(200, "alice");
+  const history = [
+    current,
+    ...Array.from({ length: 104 }, (_, i) => issue(i + 1, "alice")),
+    pr(150, "alice"),
+  ];
   const { github, calls } = makeGithub({ history });
   const result = await run(
-    args({ github, context: makeContext(pr(200, "alice"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, false);
   assert.equal(calls.createComment.length, 0);
 });
 
 test("history is queried for the item's author across all states", async () => {
-  const { github, calls } = makeGithub();
-  await run(args({ github, context: makeContext(pr(50, "alice"), true) }));
+  const current = pr(50, "alice");
+  const { github, calls } = makeGithub({ history: [current] });
+  await run(args({ github, context: makeContext(current, true) }));
   assert.deepEqual(calls.listForRepo[0], {
     owner: "getsotto",
     repo: "sotto",
@@ -264,12 +288,42 @@ test("history is queried for the item's author across all states", async () => {
   });
 });
 
-test("an existing bot greeting on the item is not repeated", async () => {
+test("a transient empty history response is retried before deciding", async () => {
+  const current = pr(695, "alice");
   const { github, calls } = makeGithub({
+    history: [current, pr(10, "alice")],
+    emptyHistoryAttempts: 2,
+  });
+  const result = await run(
+    args({ github, context: makeContext(current, true) })
+  );
+  assert.equal(result.greeted, false);
+  assert.equal(result.reason, "returning-contributor");
+  assert.equal(calls.listForRepo.length, 3);
+  assert.equal(calls.createComment.length, 0);
+});
+
+test("a persistently empty history response fails instead of assuming a newcomer", async () => {
+  const current = pr(695, "alice");
+  const { github, calls } = makeGithub({
+    history: [],
+  });
+  await assert.rejects(
+    run(args({ github, context: makeContext(current, true) })),
+    /did not include pull request #695/
+  );
+  assert.equal(calls.listForRepo.length, 3);
+  assert.equal(calls.createComment.length, 0);
+});
+
+test("an existing bot greeting on the item is not repeated", async () => {
+  const current = pr(50, "newbie");
+  const { github, calls } = makeGithub({
+    history: [current],
     comments: [botComment(PR_MESSAGE)],
   });
   const result = await run(
-    args({ github, context: makeContext(pr(50, "newbie"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, false);
   assert.equal(result.reason, "already-greeted");
@@ -277,11 +331,13 @@ test("an existing bot greeting on the item is not repeated", async () => {
 });
 
 test("a human comment quoting the greeting does not suppress it", async () => {
+  const current = pr(50, "newbie");
   const { github, calls } = makeGithub({
+    history: [current],
     comments: [userComment(`quoting: ${PR_MESSAGE}`)],
   });
   const result = await run(
-    args({ github, context: makeContext(pr(50, "newbie"), true) })
+    args({ github, context: makeContext(current, true) })
   );
   assert.equal(result.greeted, true);
   assert.equal(calls.createComment.length, 1);
@@ -299,11 +355,13 @@ test("a history API failure propagates instead of assuming a newcomer", async ()
 });
 
 test("a comments API failure propagates instead of risking a duplicate", async () => {
+  const current = pr(50, "alice");
   const { github, calls } = makeGithub({
+    history: [current],
     failures: { listComments: "boom" },
   });
   await assert.rejects(
-    run(args({ github, context: makeContext(pr(50, "alice"), true) })),
+    run(args({ github, context: makeContext(current, true) })),
     /boom/
   );
   assert.equal(calls.createComment.length, 0);
@@ -370,6 +428,7 @@ test("an account lookup failure propagates instead of assuming a newcomer", asyn
 test("the item itself is not its own earlier contribution", () => {
   const item = pr(50, "alice");
   assert.equal(hasEarlierContribution([item], item.user.id, 50), false);
+  assert.equal(hasCurrentPullRequest([item], item.user.id, 50), true);
 });
 
 test("hasGreeting needs a bot author carrying the marker", () => {
