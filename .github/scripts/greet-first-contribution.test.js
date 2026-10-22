@@ -15,8 +15,6 @@ const {
   hasGreeting,
 } = require("./greet-first-contribution.js");
 
-const ISSUE_MESSAGE =
-  "Thanks for opening your first issue in Sotto, and welcome.\n\nIssue body.";
 const PR_MESSAGE =
   "Thanks for your first pull request to Sotto, and welcome.\n\nPR body.";
 
@@ -133,7 +131,7 @@ function makeGithub({
   return { github, calls };
 }
 
-function makeContext(item, isPr) {
+function makeContext(item, isPr = true) {
   return {
     repo: { owner: "getsotto", repo: "sotto" },
     payload: isPr ? { pull_request: item } : { issue: item },
@@ -147,7 +145,6 @@ function args(overrides) {
     github: overrides.github,
     context: overrides.context,
     core,
-    issueMessage: ISSUE_MESSAGE,
     prMessage: PR_MESSAGE,
   };
 }
@@ -158,6 +155,7 @@ test("a new author's first pull request is greeted", async () => {
     args({ github, context: makeContext(pr(50, "newbie"), true) })
   );
   assert.equal(result.greeted, true);
+  assert.equal(result.reason, "first-pr");
   assert.equal(calls.createComment.length, 1);
   assert.equal(calls.createComment[0].issue_number, 50);
   assert.equal(calls.createComment[0].body, PR_MESSAGE);
@@ -191,13 +189,16 @@ test("an author with only issues is greeted on their first pull request", async 
   assert.equal(calls.createComment[0].body, PR_MESSAGE);
 });
 
-test("an author with only pull requests is greeted on their first issue", async () => {
+test("issues are never greeted", async () => {
   const { github, calls } = makeGithub({ history: [pr(5, "alice")] });
   const result = await run(
     args({ github, context: makeContext(issue(50, "alice"), false) })
   );
-  assert.equal(result.greeted, true);
-  assert.equal(calls.createComment[0].body, ISSUE_MESSAGE);
+  assert.equal(result.greeted, false);
+  assert.equal(result.reason, "no-item");
+  assert.equal(calls.getUser.length, 0);
+  assert.equal(calls.listForRepo.length, 0);
+  assert.equal(calls.createComment.length, 0);
 });
 
 test("items numbered after the current one do not block the greeting", async () => {
@@ -333,9 +334,9 @@ test("a full rename after the event still finds the author's history", async () 
 
 test("an earlier item counts by account id, whatever its login", () => {
   const history = [pr(10, "Alice", { user: user("Alice", 1) })];
-  assert.equal(hasEarlierContribution(history, true, 1, 50), true);
+  assert.equal(hasEarlierContribution(history, 1, 50), true);
   // A released login can be claimed by another account; its items stay theirs.
-  assert.equal(hasEarlierContribution(history, true, 2, 50), false);
+  assert.equal(hasEarlierContribution(history, 2, 50), false);
 });
 
 test("an account lookup failure propagates instead of assuming a newcomer", async () => {
@@ -352,7 +353,7 @@ test("an account lookup failure propagates instead of assuming a newcomer", asyn
 
 test("the item itself is not its own earlier contribution", () => {
   const item = pr(50, "alice");
-  assert.equal(hasEarlierContribution([item], true, item.user.id, 50), false);
+  assert.equal(hasEarlierContribution([item], item.user.id, 50), false);
 });
 
 test("hasGreeting needs a bot author carrying the marker", () => {
