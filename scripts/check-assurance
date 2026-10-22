@@ -107,7 +107,14 @@ def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, tested_s
 
 
 def _get_json(url, token):
-    request = Request(url, headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"})
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Cache-Control": "no-cache",
+        },
+    )
     for attempt in range(len(API_RETRY_DELAYS) + 1):
         try:
             with urlopen(request, timeout=30) as response:

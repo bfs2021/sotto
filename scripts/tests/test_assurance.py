@@ -211,6 +211,8 @@ class AssuranceTests(unittest.TestCase):
                 result = assurance._get_json("https://api.github.com/example", "token")
         self.assertEqual(result, {"ok": True})
         self.assertEqual(open_url.call_count, 2)
+        request = open_url.call_args_list[0].args[0]
+        self.assertEqual(request.get_header("Cache-control"), "no-cache")
         sleep.assert_called_once_with(1)
 
     def test_get_json_does_not_retry_permanent_client_errors(self):
