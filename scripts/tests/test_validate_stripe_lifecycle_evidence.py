@@ -68,7 +68,7 @@ class LifecycleEvidence(unittest.TestCase):
             "sandbox_account_id": "acct_test_lifecycle",
             "captured_at": "2026-10-07T00:00:00Z",
             "image_digest": "sha256:" + "b" * 64,
-            "migration_state": {"latest_applied": "0075", "pending": 0},
+            "migration_state": {"latest_applied": validator.latest_migration_version(), "pending": 0},
             "tool_versions": {key: "1.2.3" for key in validator.REQUIRED_TOOL_VERSIONS},
             "client_versions": {key: "1.2.3" for key in validator.REQUIRED_CLIENT_VERSIONS},
             "scenarios": scenarios,
@@ -136,6 +136,37 @@ class LifecycleEvidence(unittest.TestCase):
         value = self.evidence()
         value["app_sha"] = "abcdef0"
         with self.assertRaisesRegex(ValueError, "full lowercase commit SHA"):
+            validator.validate(str(self.write(value)))
+
+    def test_stale_migration_version_is_rejected(self):
+        value = self.evidence()
+        value["migration_state"]["latest_applied"] = "0001"
+        with self.assertRaisesRegex(ValueError, "match current version"):
+            validator.validate(str(self.write(value)))
+
+    def test_duplicate_manifest_json_keys_are_rejected(self):
+        value = self.evidence()
+        rendered = json.dumps(value)
+        rendered = rendered.replace(
+            '"app_sha": "' + value["app_sha"] + '"',
+            '"app_sha": "' + value["app_sha"] + '", "app_sha": "' + value["app_sha"] + '"',
+            1,
+        )
+        path = self.root / "duplicate-manifest.json"
+        path.write_text(rendered, encoding="utf-8")
+        with self.assertRaisesRegex(validator.DuplicateJsonKeyError, "duplicate JSON key: app_sha"):
+            validator.validate(str(path))
+
+    def test_duplicate_observation_json_keys_are_rejected(self):
+        value = self.evidence()
+        row = value["scenarios"][0]
+        observation_path = self.root / row["evidence_file"]
+        raw = observation_path.read_text(encoding="utf-8")
+        row_app_sha = '"app_sha":"' + value["app_sha"] + '"'
+        duplicate = row_app_sha + ',"app_sha":"' + value["app_sha"] + '"'
+        observation_path.write_text(raw.replace(row_app_sha, duplicate, 1), encoding="utf-8")
+        row["evidence_sha256"] = hashlib.sha256(observation_path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "observation .* is not valid JSON"):
             validator.validate(str(self.write(value)))
 
     def test_template_contains_every_case_and_cannot_pass_as_is(self):

@@ -23,6 +23,7 @@ SCHEMA = "sotto-stripe-lifecycle-acceptance-v4"
 OBSERVATION_SCHEMA = "sotto-stripe-lifecycle-observation-v1"
 REQUIRED_TOOL_VERSIONS = ("postgres", "rust", "stripe_cli", "node", "playwright")
 REQUIRED_CLIENT_VERSIONS = ("server", "web", "cli", "previous_minor_web", "previous_minor_cli")
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "crates/server/migrations"
 REQUIRED_SCENARIOS = (
     "personal_monthly_initial",
     "personal_annual_initial",
@@ -130,6 +131,30 @@ REQUIRED_CHECKS = {
 ID_RE = re.compile(r"^[A-Za-z0-9_:.\-/]+$")
 
 
+class DuplicateJsonKeyError(ValueError):
+    """A JSON object repeats a key and would parse ambiguously across implementations."""
+
+
+def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKeyError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def latest_migration_version() -> str:
+    versions = []
+    for path in MIGRATIONS_DIR.glob("*.sql"):
+        match = re.match(r"^(\d+)_", path.name)
+        if match:
+            versions.append(int(match.group(1)))
+    if not versions:
+        raise ValueError("could not determine the current migration version")
+    return f"{max(versions):04d}"
+
+
 def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
@@ -165,8 +190,9 @@ def validate_migration_state(value: object) -> dict[str, object]:
         raise ValueError("migration_state must include latest_applied and pending")
     latest = value["latest_applied"]
     pending = value["pending"]
-    if not isinstance(latest, str) or not re.fullmatch(r"[0-9]{4}", latest):
-        raise ValueError("migration_state.latest_applied must be a four-digit version")
+    expected_latest = latest_migration_version()
+    if latest != expected_latest:
+        raise ValueError(f"migration_state.latest_applied must match current version {expected_latest}")
     if type(pending) is not int or pending != 0:
         raise ValueError("migration_state.pending must be zero")
     return {"latest_applied": latest, "pending": pending}
@@ -194,8 +220,8 @@ def read_observation(
     if actual_digest != supplied_digest:
         raise ValueError(f"evidence_sha256 for {scenario} does not match its observation file")
     try:
-        artifact = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        artifact = json.loads(raw, object_pairs_hook=reject_duplicate_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateJsonKeyError) as error:
         raise ValueError(f"observation for {scenario} is not valid JSON") from error
     expected_shape = {
         "schema", "scenario", "app_sha", "api_version", "captured_at",
@@ -242,7 +268,7 @@ def read_observation(
 def validate(path: str) -> tuple[dict, list[str]]:
     manifest_path = Path(path)
     manifest_raw = manifest_path.read_bytes()
-    value = json.loads(manifest_raw)
+    value = json.loads(manifest_raw, object_pairs_hook=reject_duplicate_json_keys)
     if not isinstance(value, dict):
         raise ValueError("lifecycle evidence must be an object")
     expected = {
@@ -351,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             "sandbox_account_id": "replace-with-the-test-account-id",
             "captured_at": datetime.now().astimezone().isoformat(),
             "image_digest": "sha256:" + "0" * 64,
-            "migration_state": {"latest_applied": "0075", "pending": 0},
+            "migration_state": {"latest_applied": latest_migration_version(), "pending": 0},
             "tool_versions": {key: "replace-with-observed-version" for key in REQUIRED_TOOL_VERSIONS},
             "client_versions": {key: "replace-with-observed-version" for key in REQUIRED_CLIENT_VERSIONS},
             "scenarios": [
