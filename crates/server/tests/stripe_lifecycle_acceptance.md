@@ -21,7 +21,7 @@ Every row must be observed on the same application commit and pinned API version
 | `personal_founding_monthly_initial` | The founding price and place allocation are recorded; the renewal amount is the configured standard monthly price. |
 | `personal_founding_annual_initial` | The founding annual term and anniversary are recorded; the renewal amount is the configured standard annual price. |
 | `personal_renewal` | A test clock or an equivalent supported Stripe test mechanism produces exactly one next invoice and one paid-through advance. |
-| `personal_interval_switch` | A monthly-to-annual or annual-to-monthly change has one effective boundary and no duplicate invoice or overlapping term. |
+| `personal_interval_switch` | During a founding term, attempt a monthly/annual interval change through the hosted portal. It must be unavailable; the stored offer, interval and paid-through date remain unchanged, and no schedule or invoice is created. Founders keep their original interval through the founding term and transition to the matching standard interval at the original anniversary. |
 | `personal_cancellation` | Advance a monthly founder at least one renewal while still inside the founding phase, then cancel through Sotto's endpoint; verify the current paid phase remains intact, the schedule ends with cancellation at the paid-period boundary, and no renewal invoice follows. Confirm the subscription webhook's `cancel_at` keeps the account marked to cancel even if `cancel_at_period_end` is false. Also verify an unscheduled personal subscription retains period-end cancellation and that lifting it clears the cancellation intent and restores the founding transition. |
 | `personal_full_refund_cancellation` | An explicitly approved full refund is recorded before termination; a failed or pending refund leaves the paid term available. |
 | `personal_failed_renewal_recovery` | One failed renewal produces one recovery window and export deadline; a later paid recovery closes the episode without extending access twice. |
@@ -60,19 +60,24 @@ shared.
 6. Exercise replay, out-of-order delivery, and a worker restart using the same event ids and
    operation keys. The expected result is one durable outcome, not merely a successful HTTP
    response.
-7. Copy the observations into a private manifest matching the input shape accepted by
-   `scripts/validate-stripe-lifecycle-evidence`. Keep raw ids in that private file only:
+7. Generate a private manifest template with `--template`, then set the tested SHA, account,
+   capture time, provider ids and each scenario result. The template supplies the versioned,
+   scenario-specific check identifiers; leave that list unchanged and mark a scenario `passed`
+   only after every listed fact has been observed. The validator rejects arbitrary check text,
+   missing checks and extra checks. This makes the required assertions explicit; it does not
+   independently prove the operator's observations. Keep raw ids in the private file only:
 
    ```sh
+   scripts/validate-stripe-lifecycle-evidence --template /private/path/stripe-lifecycle-evidence.json
    scripts/validate-stripe-lifecycle-evidence \
      /private/path/stripe-lifecycle-evidence.json \
      --output /private/path/stripe-lifecycle-report.json
    ```
 
-   The command writes a report containing only the app SHA, pinned API version, aggregate check
-   counts, and fingerprints of provider ids. It exits non-zero for a failed, blocked, or missing
-   scenario. Attach that sanitised report and the reviewer's signed run notes to the release
-   decision; do not attach the input manifest.
+   The command writes a report containing only the app SHA, pinned API version, fixed assertion
+   identifiers, aggregate check counts, and fingerprints of provider ids. It exits non-zero for a
+   failed, blocked, or missing scenario. Attach that sanitised report and the reviewer's signed run
+   notes to the release decision; do not attach the input manifest.
 
 ## Activation decision
 

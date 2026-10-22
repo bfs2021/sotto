@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 PINNED_API_VERSION = "2026-07-29.dahlia"
-SCHEMA = "sotto-stripe-lifecycle-acceptance-v1"
+SCHEMA = "sotto-stripe-lifecycle-acceptance-v2"
 REQUIRED_SCENARIOS = (
     "personal_monthly_initial",
     "personal_annual_initial",
@@ -38,6 +38,80 @@ REQUIRED_SCENARIOS = (
     "human_export_and_restore",
     "retention_scope_and_restore",
 )
+REQUIRED_CHECKS = {
+    "personal_monthly_initial": (
+        "checkout_settled", "invoice_amount_matches_catalogue", "paid_through_matches_invoice",
+        "next_price_is_standard_monthly",
+    ),
+    "personal_annual_initial": (
+        "checkout_settled", "invoice_amount_matches_catalogue", "paid_through_matches_invoice",
+        "next_price_is_standard_annual",
+    ),
+    "personal_founding_monthly_initial": (
+        "founding_price_charged", "founding_place_awarded_to_person", "paid_through_matches_invoice",
+        "anniversary_uses_standard_monthly_price",
+    ),
+    "personal_founding_annual_initial": (
+        "founding_price_charged", "founding_place_awarded_to_person", "paid_through_matches_invoice",
+        "anniversary_matches_calendar_term", "anniversary_uses_standard_annual_price",
+    ),
+    "personal_renewal": (
+        "exactly_one_renewal_invoice", "paid_through_advanced_once", "next_period_matches_provider",
+    ),
+    "personal_interval_switch": (
+        "founding_interval_change_refused", "offer_and_interval_unchanged", "paid_through_unchanged",
+        "no_schedule_or_invoice_created", "founding_anniversary_keeps_original_interval",
+    ),
+    "personal_cancellation": (
+        "paid_phase_preserved", "schedule_ends_at_paid_boundary", "no_invoice_after_cancellation_boundary",
+        "stale_webhook_does_not_clear_cancellation", "unscheduled_cancel_remains_period_end",
+        "lifting_cancel_restores_founding_transition",
+    ),
+    "personal_full_refund_cancellation": (
+        "successful_full_refund_precedes_termination", "pending_refund_preserves_paid_access",
+        "unknown_refund_retry_does_not_duplicate_payout", "termination_failure_is_retryable",
+    ),
+    "personal_failed_renewal_recovery": (
+        "failure_links_to_paid_predecessor", "recovery_window_is_fourteen_days",
+        "personal_and_sponsored_paths_are_observed", "repayment_closes_episode_once",
+        "uncertain_outcome_preserves_paid_through", "mixed_sources_are_complete",
+    ),
+    "sponsored_initial_mixed_items": (
+        "one_grouped_subscription_invoice", "every_named_allocation_links_to_invoice_item",
+        "line_quantities_match_named_allocations", "mixed_intervals_match_paid_terms",
+    ),
+    "sponsored_anniversary": (
+        "one_renewal_invoice", "named_seats_remain_covered", "founding_seats_move_to_standard_price",
+        "non_founder_seats_keep_standard_price",
+    ),
+    "sponsored_seat_replacement": (
+        "removal_and_replacement_share_one_boundary", "no_overlapping_named_seats",
+        "invoice_quantities_match_named_seats",
+    ),
+    "sponsored_payer_transfer": (
+        "source_and_destination_consent_observed", "transfer_starts_at_next_renewal",
+        "failed_destination_restores_personal_payer_or_holds_sponsor",
+        "wrong_period_evidence_is_parked_again_after_resume", "two_post_transfer_renewals_succeed",
+        "sponsor_day_31_and_leap_year_terms_match_provider",
+    ),
+    "webhook_replay_and_out_of_order_delivery": (
+        "duplicate_delivery_has_one_durable_effect", "same_second_failure_and_state_events_both_apply",
+        "async_checkout_event_orders_converge", "missed_event_repair_is_idempotent",
+    ),
+    "ambiguous_provider_outcome_and_worker_restart": (
+        "provider_timeout_is_recorded_as_ambiguous", "restart_reuses_operation_idempotency",
+        "remote_success_is_verified_before_local_completion", "cleanup_is_scoped_to_run_resources",
+    ),
+    "human_export_and_restore": (
+        "partial_organisation_grants_export_without_unshared_data",
+        "restore_succeeds_in_supported_self_host_target", "machine_token_cannot_use_human_export",
+        "free_recipient_remains_usable",
+    ),
+    "retention_scope_and_restore": (
+        "personal_shared_and_link_scopes_are_classified", "notice_and_real_deadline_evidence_is_present",
+        "purge_deletes_only_approved_scope", "tombstone_replay_twice_does_not_resurrect_rows",
+    ),
+}
 ID_RE = re.compile(r"^[A-Za-z0-9_:.\-/]+$")
 
 
@@ -89,11 +163,20 @@ def validate(path: str) -> tuple[dict, list[str]]:
             raise ValueError(f"unexpected or duplicate scenario: {scenario}")
         seen.add(scenario)
         result = row["result"]
-        if result not in {"passed", "failed", "blocked", "not_run"}:
+        if not isinstance(result, str) or result not in {"passed", "failed", "blocked", "not_run"}:
             raise ValueError(f"invalid result for {scenario}: {result!r}")
         checks = row["checks"]
-        if not isinstance(checks, list) or not checks or not all(isinstance(check, str) and check for check in checks):
-            raise ValueError(f"checks for {scenario} must be a non-empty list of strings")
+        if not isinstance(checks, list) or not all(isinstance(check, str) and check for check in checks):
+            raise ValueError(f"checks for {scenario} must be a list of required check identifiers")
+        required_checks = set(REQUIRED_CHECKS[scenario])
+        observed_checks = set(checks)
+        if len(observed_checks) != len(checks) or observed_checks != required_checks:
+            missing_checks = sorted(required_checks - observed_checks)
+            unexpected_checks = sorted(observed_checks - required_checks)
+            raise ValueError(
+                f"scenario {scenario} must contain its exact required checks "
+                f"(missing: {missing_checks}; unexpected: {unexpected_checks})"
+            )
         provider_ids = row["provider_ids"]
         if not isinstance(provider_ids, list) or not all(isinstance(item, str) and ID_RE.fullmatch(item) for item in provider_ids):
             raise ValueError(f"provider_ids for {scenario} must contain only provider identifiers")
@@ -103,6 +186,7 @@ def validate(path: str) -> tuple[dict, list[str]]:
             {
                 "scenario": scenario,
                 "result": result,
+                "checks": checks,
                 "check_count": len(checks),
                 "provider_id_fingerprints": [fingerprint(item) for item in provider_ids],
             }
@@ -141,7 +225,12 @@ def main(argv: list[str] | None = None) -> int:
             "sandbox_account_id": "replace-with-the-test-account-id",
             "captured_at": datetime.now().astimezone().isoformat(),
             "scenarios": [
-                {"scenario": scenario, "result": "not_run", "checks": ["replace with observed checks"], "provider_ids": []}
+                {
+                    "scenario": scenario,
+                    "result": "not_run",
+                    "checks": list(REQUIRED_CHECKS[scenario]),
+                    "provider_ids": [],
+                }
                 for scenario in REQUIRED_SCENARIOS
             ],
         }

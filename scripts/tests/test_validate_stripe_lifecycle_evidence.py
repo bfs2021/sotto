@@ -27,7 +27,7 @@ def evidence():
             {
                 "scenario": scenario,
                 "result": "passed",
-                "checks": ["provider state matched application state"],
+                "checks": list(validator.REQUIRED_CHECKS[scenario]),
                 "provider_ids": [f"id_{scenario}"],
             }
             for scenario in validator.REQUIRED_SCENARIOS
@@ -57,6 +57,9 @@ class LifecycleEvidence(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(report["scenario_count"], len(validator.REQUIRED_SCENARIOS))
         self.assertEqual(report["sandbox_account_fingerprint"], validator.fingerprint("acct_test_lifecycle"))
+        interval = next(row for row in report["scenarios"] if row["scenario"] == "personal_interval_switch")
+        self.assertIn("founding_interval_change_refused", interval["checks"])
+        self.assertIn("founding_anniversary_keeps_original_interval", interval["checks"])
         self.assertNotIn("acct_test_lifecycle", Path(output_path).read_text(encoding="utf-8"))
         self.assertNotIn("id_personal_monthly_initial", Path(output_path).read_text(encoding="utf-8"))
 
@@ -87,8 +90,16 @@ class LifecycleEvidence(unittest.TestCase):
             [row["scenario"] for row in value["scenarios"]],
             list(validator.REQUIRED_SCENARIOS),
         )
+        for row in value["scenarios"]:
+            self.assertEqual(row["checks"], list(validator.REQUIRED_CHECKS[row["scenario"]]))
         with self.assertRaisesRegex(ValueError, "commit SHA"):
             validator.validate(self.write(value))
+
+    def test_every_required_scenario_has_a_nonempty_unique_check_contract(self):
+        self.assertEqual(set(validator.REQUIRED_CHECKS), set(validator.REQUIRED_SCENARIOS))
+        for scenario, checks in validator.REQUIRED_CHECKS.items():
+            self.assertTrue(checks, scenario)
+            self.assertEqual(len(checks), len(set(checks)), scenario)
 
     def test_template_and_validation_modes_cannot_be_combined(self):
         with self.assertRaises(SystemExit) as error:
@@ -101,6 +112,37 @@ class LifecycleEvidence(unittest.TestCase):
         report, _ = validator.validate(self.write(value))
         rendered = json.dumps(report)
         self.assertNotIn("sub_secret_123", rendered)
+
+    def test_free_form_claim_cannot_replace_required_scenario_checks(self):
+        value = evidence()
+        interval = next(
+            row for row in value["scenarios"] if row["scenario"] == "personal_interval_switch"
+        )
+        interval["checks"] = ["interval was safely handled"]
+        with self.assertRaisesRegex(ValueError, "required checks"):
+            validator.validate(self.write(value))
+
+    def test_interval_change_scenario_requires_refusal_without_billing_mutation(self):
+        value = evidence()
+        interval = next(
+            row for row in value["scenarios"] if row["scenario"] == "personal_interval_switch"
+        )
+        interval["checks"].remove("founding_interval_change_refused")
+        interval["checks"].append("founding_interval_change_applied")
+        with self.assertRaisesRegex(ValueError, "required checks"):
+            validator.validate(self.write(value))
+
+    def test_schema_v2_is_required_for_structured_assertions(self):
+        value = evidence()
+        value["schema"] = "sotto-stripe-lifecycle-acceptance-v1"
+        with self.assertRaisesRegex(ValueError, "unsupported lifecycle evidence schema"):
+            validator.validate(self.write(value))
+
+    def test_non_string_result_is_a_validation_error(self):
+        value = evidence()
+        value["scenarios"][0]["result"] = ["passed"]
+        with self.assertRaisesRegex(ValueError, "invalid result"):
+            validator.validate(self.write(value))
 
 
 if __name__ == "__main__":
