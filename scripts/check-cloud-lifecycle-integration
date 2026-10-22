@@ -128,13 +128,14 @@ def run_database_utility(command: list[str], env: dict[str, str]) -> str:
 
 
 def cleanup_scenario_databases(cli_env: dict[str, str], prefix: str) -> None:
+    if not re.fullmatch(r"lc_[0-9a-f]{16}", prefix):
+        raise RuntimeError("lifecycle test database prefix is invalid")
     marker = f"{prefix}_upgrade_"
     listed = run_database_utility(
         [
             "psql", "--no-psqlrc", "--no-align", "--tuples-only", "--dbname=postgres",
-            f"--set=prefix={marker}",
             "--command=SELECT datname FROM pg_database "
-            "WHERE left(datname, length(:'prefix')) = :'prefix' ORDER BY datname",
+            f"WHERE left(datname, {len(marker)}) = '{marker}' ORDER BY datname",
         ],
         cli_env,
     )

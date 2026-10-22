@@ -87,15 +87,17 @@ class LifecycleManifest(unittest.TestCase):
             calls.append((command, kwargs))
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with mock.patch.object(MODULE.secrets, "token_hex", return_value="deadbeef"):
+        with mock.patch.object(MODULE.secrets, "token_hex", return_value="deadbeefdeadbeefcafebabe"):
             with mock.patch.object(MODULE.subprocess, "run", side_effect=utility):
                 with self.assertRaisesRegex(RuntimeError, "simulated test failure"):
                     with MODULE.disposable_acceptance_database(env) as test_env:
                         self.assertEqual(
                             test_env["DATABASE_URL"],
-                            "postgres://sotto:p%40ss@localhost:5432/sotto_lifecycle_acceptance_deadbeef",
+                            "postgres://sotto:p%40ss@localhost:5432/sotto_lifecycle_acceptance_deadbeefdeadbeefcafebabe",
                         )
-                        self.assertEqual(test_env["SOTTO_TEST_DATABASE_PREFIX"], "lc_deadbeef")
+                        self.assertEqual(
+                            test_env["SOTTO_TEST_DATABASE_PREFIX"], "lc_deadbeefdeadbeef"
+                        )
                         raise RuntimeError("simulated test failure")
         self.assertEqual([call[0][0] for call in calls], ["createdb", "psql", "dropdb"])
         self.assertNotIn("p@ss", " ".join(calls[0][0]))
@@ -106,15 +108,20 @@ class LifecycleManifest(unittest.TestCase):
 
         def utility(command, env):
             calls.append(command)
-            output = "lc_deadbeef_upgrade_" + "a" * 32 + "\n"
+            output = "lc_deadbeefdeadbeef_upgrade_" + "a" * 32 + "\n"
             return output if command[0] == "psql" else ""
 
         with mock.patch.object(MODULE, "run_database_utility", side_effect=utility):
-            MODULE.cleanup_scenario_databases({}, "lc_deadbeef")
+            MODULE.cleanup_scenario_databases({}, "lc_deadbeefdeadbeef")
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0], "psql")
-        self.assertIn("lc_deadbeef_upgrade_", calls[0][5])
-        self.assertEqual(calls[1][-1], "lc_deadbeef_upgrade_" + "a" * 32)
+        self.assertIn("left(datname, 28) = 'lc_deadbeefdeadbeef_upgrade_'", calls[0][5])
+        self.assertNotIn(":'prefix'", calls[0][5])
+        self.assertEqual(calls[1][-1], "lc_deadbeefdeadbeef_upgrade_" + "a" * 32)
+
+    def test_cleanup_rejects_an_untrusted_database_prefix(self):
+        with self.assertRaisesRegex(RuntimeError, "prefix is invalid"):
+            MODULE.cleanup_scenario_databases({}, "lc_'; DROP DATABASE postgres; --")
 
     def test_cleanup_reports_test_and_database_cleanup_failures(self):
         env = {
@@ -124,12 +131,12 @@ class LifecycleManifest(unittest.TestCase):
 
         def utility(command, env):
             if command[0] == "psql":
-                return "lc_deadbeef_upgrade_" + "a" * 32
+                return "lc_deadbeefdeadbeef_upgrade_" + "a" * 32
             if command[0] == "dropdb":
                 raise RuntimeError("dropdb failed: drop failed")
             return ""
 
-        with mock.patch.object(MODULE.secrets, "token_hex", return_value="deadbeef"):
+        with mock.patch.object(MODULE.secrets, "token_hex", return_value="deadbeefdeadbeefcafebabe"):
             with mock.patch.object(MODULE, "run_database_utility", side_effect=utility):
                 with self.assertRaisesRegex(RuntimeError, "simulated test failure.*cleanup also failed"):
                     with MODULE.disposable_acceptance_database(env):
@@ -145,7 +152,7 @@ class LifecycleManifest(unittest.TestCase):
             status = 0 if command[0] == "createdb" else 1
             return subprocess.CompletedProcess(command, status, "", "cleanup failed")
 
-        with mock.patch.object(MODULE.secrets, "token_hex", return_value="deadbeef"):
+        with mock.patch.object(MODULE.secrets, "token_hex", return_value="deadbeefdeadbeefcafebabe"):
             with mock.patch.object(MODULE.subprocess, "run", side_effect=utility):
                 with self.assertRaisesRegex(RuntimeError, "dropdb failed"):
                     with MODULE.disposable_acceptance_database(env):
