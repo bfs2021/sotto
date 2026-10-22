@@ -337,7 +337,7 @@ Mitglied bereits gesehen hat, bleiben offengelegt; ändere sie daher an ihrer Qu
 `sotto org plan <org-id>` liest die aktuelle Berechtigungsansicht des konfigurierten Servers für
 diese Organisation. Du musst angemeldet sein (`sotto login`); der lokale Tresor muss nicht
 entsperrt sein. Es zeigt die zugewiesene und wirksame Stufe, das gespeicherte Trial-Ende und die
-geltenden Limits. Diese Felder erhalten die Kompatibilität mit älteren Organisationsplan-Datensätzen
+geltenden Limits wie `limits: none (Team)`. Diese Felder erhalten die Kompatibilität mit älteren Organisationsplan-Datensätzen
 und Deployments; sie beschreiben weder die aktuellen personenbezogenen Cloud-Preise noch ein neues
 Cloud-Trial-Angebot.
 

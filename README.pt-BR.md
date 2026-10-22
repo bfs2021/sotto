@@ -335,7 +335,7 @@ origem.
 `sotto org plan <org-id>` lê a visão atual de direitos do servidor configurado para essa
 organização. É preciso estar autenticado (`sotto login`); o cofre local não precisa estar
 desbloqueado. Ele mostra os níveis atribuído e efetivo, a data de trial armazenada e os limites
-aplicáveis. Esses campos mantêm a compatibilidade com registros e implantações antigas de planos
+aplicáveis, como `limits: none (Team)`. Esses campos mantêm a compatibilidade com registros e implantações antigas de planos
 por organização; eles não descrevem os preços atuais do Cloud por pessoa nem uma nova oferta de
 trial do Cloud.
 

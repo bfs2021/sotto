@@ -342,7 +342,7 @@ changez-les à leur source.
 `sotto org plan <org-id>` lit la vue d'entitlements actuelle du serveur configuré pour cette
 organisation. Vous devez être connecté (`sotto login`) ; le coffre local n'a pas besoin d'être
 déverrouillé. Il affiche le niveau assigné, le niveau effectif, la fin d'essai enregistrée et les
-limites applicables. Ces champs préservent la compatibilité avec les anciens enregistrements et
+limites applicables, comme `limits: none (Team)`. Ces champs préservent la compatibilité avec les anciens enregistrements et
 déploiements à forfait d'organisation ; ils ne décrivent ni les tarifs Cloud actuels par personne ni
 une nouvelle offre d'essai Cloud.
 
