@@ -70,7 +70,7 @@ jobs:
       - name: Install PostgreSQL client tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends postgresql-client-16
+          sudo apt-get install --no-install-recommends postgresql-client
       - name: Integrated Cloud lifecycle database scenarios
         run: |
           DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto_lifecycle_acceptance \
