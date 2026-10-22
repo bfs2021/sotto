@@ -3,10 +3,11 @@
 /**
  * First-time contributor greeting for .github/workflows/greet.yml.
  *
- * An author is greeted once on their first pull request in this repository.
- * An earlier pull request counts whether it is open, closed, or merged; items
- * from other accounts and issues never count; and pull requests numbered after
- * the current one cannot block the earliest greeting.
+ * An external author is greeted once on their first pull request in this
+ * repository. Repository owners, organisation members, and collaborators are
+ * never greeted. An earlier pull request counts whether it is open, closed, or
+ * merged; items from other accounts and issues never count; and pull requests
+ * numbered after the current one cannot block the earliest greeting.
  * Authors are identified by account id, never by login, because a login can
  * change between the event and the run (see run()).
  * A bot greeting already on the pull request suppresses a second post, so
@@ -17,6 +18,12 @@
  * out base branch - under pull_request_target that is always
  * repository-controlled code, never the contributor's.
  */
+
+const MAINTAINER_ASSOCIATIONS = new Set([
+  "OWNER",
+  "MEMBER",
+  "COLLABORATOR",
+]);
 
 /** The issues API returns pull requests too; this field is the divider. */
 function isPullRequestItem(item) {
@@ -49,9 +56,9 @@ function hasGreeting(comments, marker) {
 }
 
 /**
- * Post `prMessage` on the opened pull request when it is the author's first
- * pull request and no greeting is there yet. Returns a small decision record;
- * throws on API failure so the workflow run reports it.
+ * Post `prMessage` on the opened pull request when it is an external author's
+ * first pull request and no greeting is there yet. Returns a small decision
+ * record; throws on API failure so the workflow run reports it.
  */
 async function run({ github, context, core, prMessage }) {
   const { owner, repo } = context.repo;
@@ -65,6 +72,13 @@ async function run({ github, context, core, prMessage }) {
   const authorId = item.user.id;
   if (!prMessage) {
     throw new Error("No greeting message configured for a first pull request.");
+  }
+
+  if (MAINTAINER_ASSOCIATIONS.has(item.author_association)) {
+    core.info(
+      `${item.user.login} has author_association ${item.author_association}; no greeting.`
+    );
+    return { greeted: false, reason: "maintainer" };
   }
 
   // The payload's login is the one the author had when the event fired, and

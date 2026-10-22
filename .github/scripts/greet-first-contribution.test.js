@@ -42,6 +42,7 @@ function pr(number, login, extra = {}) {
     number,
     state: "closed",
     user: user(login),
+    author_association: "FIRST_TIME_CONTRIBUTOR",
     pull_request: { merged_at: null },
     ...extra,
   };
@@ -199,6 +200,21 @@ test("issues are never greeted", async () => {
   assert.equal(calls.getUser.length, 0);
   assert.equal(calls.listForRepo.length, 0);
   assert.equal(calls.createComment.length, 0);
+});
+
+test("owners, members, and collaborators are never greeted", async () => {
+  for (const author_association of ["OWNER", "MEMBER", "COLLABORATOR"]) {
+    const { github, calls } = makeGithub();
+    const item = pr(695, "Maxerns", { author_association });
+    const result = await run(
+      args({ github, context: makeContext(item, true) })
+    );
+    assert.equal(result.greeted, false);
+    assert.equal(result.reason, "maintainer");
+    assert.equal(calls.getUser.length, 0);
+    assert.equal(calls.listForRepo.length, 0);
+    assert.equal(calls.createComment.length, 0);
+  }
 });
 
 test("items numbered after the current one do not block the greeting", async () => {
