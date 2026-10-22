@@ -13,13 +13,14 @@ use axum::routing::{get, post};
 use axum::{middleware, Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe_event_repair::StripeEventRepairDisposition;
+use crate::cloud_provider_stripe_http::StripeReadError;
 use crate::error::{Error, Result};
 use crate::state::AppState;
 
@@ -53,6 +54,7 @@ const COVERAGE_REJECTION_REASONS: &[&str] = &[
     "sponsored_invoice_item_binding_mismatch",
     "sponsored_invoice_manifest_mismatch",
     "sponsored_invoice_manifest_rejected",
+    "sponsored_invoice_no_eligible_seats",
     "sponsored_invoice_price_unsupported",
     "sponsored_invoice_scope_exceeded",
     "sponsored_invoice_seat_ambiguous",
@@ -60,6 +62,7 @@ const COVERAGE_REJECTION_REASONS: &[&str] = &[
     "stripe_coverage_binding_required",
     "stripe_invoice_evidence_rejected",
     "stripe_payment_evidence_rejected",
+    "unlisted",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -82,6 +85,7 @@ pub struct CloudOperationsSnapshot {
     pub states: Vec<LifecycleStateMetric>,
     pub features: Vec<RuntimeFeatureMetric>,
     pub coverage_rejections_open: i64,
+    pub coverage_rejections_unrecoverable: i64,
     pub coverage_rejections_oldest_age_seconds: i64,
     pub tombstones_total: i64,
     pub founding_places_awarded: i64,
@@ -225,6 +229,14 @@ fn render_prometheus(snapshot: &CloudOperationsSnapshot) -> String {
         snapshot.coverage_rejections_oldest_age_seconds
     )
     .expect("writing to a String cannot fail");
+    output.push_str("# HELP sotto_cloud_coverage_rejections_unrecoverable Current coverage rejections whose provider event is no longer retrievable.\n");
+    output.push_str("# TYPE sotto_cloud_coverage_rejections_unrecoverable gauge\n");
+    writeln!(
+        output,
+        "sotto_cloud_coverage_rejections_unrecoverable {}",
+        snapshot.coverage_rejections_unrecoverable
+    )
+    .expect("writing to a String cannot fail");
     output.push_str(
         "# HELP sotto_cloud_retention_tombstones_total Durable deletion tombstones recorded.\n",
     );
@@ -281,7 +293,7 @@ fn render_prometheus(snapshot: &CloudOperationsSnapshot) -> String {
         snapshot.stripe_event_history_gaps
     )
     .expect("writing to a String cannot fail");
-    output.push_str("# HELP sotto_cloud_coverage_publication_latency_seconds Maximum payment-event-to-coverage publication latency in the last 24 hours.\n");
+    output.push_str("# HELP sotto_cloud_coverage_publication_latency_seconds Maximum webhook-receipt-to-coverage publication latency in the last 24 hours.\n");
     output.push_str("# TYPE sotto_cloud_coverage_publication_latency_seconds gauge\n");
     writeln!(
         output,
@@ -379,6 +391,25 @@ async fn repair_rejection(
     let mut session = stripe.session();
     let authenticated = match stripe.event_payload(&mut session, &lease.event_id).await {
         Ok(event) => event,
+        Err(StripeReadError::ResourceMissing) => {
+            finish_repair(
+                &state.pool,
+                &lease,
+                &request.operator_label,
+                "event_unavailable",
+                false,
+            )
+            .await?;
+            let mut response = Json(CoverageRepairResponse {
+                fingerprint,
+                outcome: "event_unavailable",
+            })
+            .into_response();
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            return Ok(response);
+        }
         Err(_) => {
             finish_repair(
                 &state.pool,
@@ -466,14 +497,34 @@ pub async fn record_coverage_rejection(
     coverage_kind: &str,
     reason_code: &str,
 ) -> Result<()> {
-    if !matches!(coverage_kind, "personal" | "sponsored")
-        || !COVERAGE_REJECTION_REASONS.contains(&reason_code)
-        || event_id.trim().is_empty()
-    {
+    let mut tx = pool.begin().await?;
+    record_coverage_rejection_in_tx(
+        &mut tx,
+        account_id,
+        environment,
+        event_id,
+        coverage_kind,
+        reason_code,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn record_coverage_rejection_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    account_id: &str,
+    environment: ProviderEnvironment,
+    event_id: &str,
+    coverage_kind: &str,
+    reason_code: &str,
+) -> Result<()> {
+    if !matches!(coverage_kind, "personal" | "sponsored") || event_id.trim().is_empty() {
         return Err(Error::Internal(
             "invalid coverage rejection evidence".into(),
         ));
     }
+    let reason_code = coverage_rejection_reason_code(reason_code);
     let fingerprint = rejection_fingerprint(account_id, environment, event_id, coverage_kind);
     sqlx::query(
         "INSERT INTO cloud_coverage_rejection_incidents \
@@ -489,7 +540,7 @@ pub async fn record_coverage_rejection(
     .bind(event_id)
     .bind(coverage_kind)
     .bind(reason_code)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -659,7 +710,9 @@ async fn snapshot(state: &AppState) -> Result<CloudOperationsSnapshot> {
            FROM billing_transfer_intents WHERE execution_manual_review_required \
            GROUP BY execution_manual_review_required \
          UNION ALL SELECT 'notice_delivery', status, count(*), \
-           COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0), sum(attempt_count) \
+           CASE WHEN status IN ('pending','leased','accepted','delivery_unknown') \
+             THEN COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0) ELSE 0 END, \
+           sum(attempt_count) \
            FROM cloud_notice_outbox GROUP BY status \
          UNION ALL SELECT 'retention', state, count(*), \
            COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0), sum(attempt_count) \
@@ -690,7 +743,9 @@ async fn snapshot(state: &AppState) -> Result<CloudOperationsSnapshot> {
            COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0), 0::bigint \
            FROM stripe_event_reconciliation_state GROUP BY last_outcome \
          UNION ALL SELECT 'founding_price_notice', outcome, count(*), \
-           COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0), 0::bigint \
+           CASE WHEN outcome <> 'retired' \
+             THEN COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0) ELSE 0 END, \
+           0::bigint \
            FROM billing_founding_price_notice_state GROUP BY outcome \
          UNION ALL SELECT 'stripe_event_repair', 'history_gap', count(*), \
            COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0), 0::bigint \
@@ -715,6 +770,12 @@ async fn snapshot(state: &AppState) -> Result<CloudOperationsSnapshot> {
     let (open_count, oldest_age): (i64, i64) = sqlx::query_as(
         "SELECT count(*)::bigint, COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at)))::bigint, 0) \
          FROM cloud_coverage_rejection_incidents WHERE state IN ('open','repairing')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let unrecoverable_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM cloud_coverage_rejection_incidents \
+         WHERE state = 'unrecoverable'",
     )
     .fetch_one(pool)
     .await?;
@@ -762,6 +823,7 @@ async fn snapshot(state: &AppState) -> Result<CloudOperationsSnapshot> {
         states,
         features,
         coverage_rejections_open: open_count,
+        coverage_rejections_unrecoverable: unrecoverable_count,
         coverage_rejections_oldest_age_seconds: oldest_age,
         tombstones_total,
         founding_places_awarded,
@@ -915,6 +977,13 @@ async fn finish_repair(
     outcome: &str,
     resolved: bool,
 ) -> Result<()> {
+    let state = if outcome == "event_unavailable" {
+        "unrecoverable"
+    } else if resolved {
+        "resolved"
+    } else {
+        "open"
+    };
     let mut tx = pool.begin().await?;
     let result = sqlx::query(
         "UPDATE cloud_coverage_rejection_incidents SET state = $3, \
@@ -924,7 +993,7 @@ async fn finish_repair(
     )
     .bind(&lease.fingerprint)
     .bind(&lease.lease_token)
-    .bind(if resolved { "resolved" } else { "open" })
+    .bind(state)
     .bind(resolved)
     .execute(&mut *tx)
     .await?;
@@ -946,6 +1015,14 @@ async fn finish_repair(
 
 fn valid_operator_label(value: &str) -> bool {
     (1..=80).contains(&value.trim().len()) && !value.chars().any(char::is_control)
+}
+
+fn coverage_rejection_reason_code(reason_code: &str) -> &str {
+    if COVERAGE_REJECTION_REASONS.contains(&reason_code) {
+        reason_code
+    } else {
+        "unlisted"
+    }
 }
 
 fn is_fingerprint(value: &str) -> bool {
@@ -990,6 +1067,7 @@ mod tests {
         assert!(!valid_operator_label("bad\nlabel"));
         assert!(!valid_operator_label(&"x".repeat(81)));
         assert!(COVERAGE_REJECTION_REASONS.contains(&"invoice_evidence_changed"));
+        assert_eq!(coverage_rejection_reason_code("future_reason"), "unlisted");
         assert!(!COVERAGE_REJECTION_REASONS.contains(&"provider text"));
     }
 
@@ -1024,6 +1102,7 @@ mod tests {
                 feature("provider_refresh_worker", false, false),
             ],
             coverage_rejections_open: 1,
+            coverage_rejections_unrecoverable: 2,
             coverage_rejections_oldest_age_seconds: 12,
             tombstones_total: 9,
             founding_places_awarded: 1,
@@ -1041,6 +1120,7 @@ mod tests {
             "sotto_cloud_lifecycle_retry_attempts{component=\"provider_refresh\",state=\"pending\"} 7"
         ));
         assert!(rendered.contains("sotto_cloud_coverage_rejections_open 1"));
+        assert!(rendered.contains("sotto_cloud_coverage_rejections_unrecoverable 2"));
         assert!(rendered.contains("sotto_cloud_retention_tombstones_total 9"));
         assert!(rendered.contains("sotto_cloud_founding_places_awarded 1"));
         assert!(rendered.contains("sotto_cloud_stripe_event_history_gaps 5"));
@@ -1109,6 +1189,71 @@ mod tests {
         .expect("read repaired incident");
         assert_eq!(state, "resolved");
         assert_eq!(actions, 1);
+
+        sqlx::query("DELETE FROM cloud_coverage_rejection_actions WHERE fingerprint = $1")
+            .bind(&fingerprint)
+            .execute(&pool)
+            .await
+            .expect("clean repair action");
+        sqlx::query("DELETE FROM cloud_coverage_rejection_incidents WHERE fingerprint = $1")
+            .bind(&fingerprint)
+            .execute(&pool)
+            .await
+            .expect("clean repair incident");
+    }
+
+    #[tokio::test]
+    async fn missing_stripe_event_closes_repair_as_unrecoverable_and_audits_it() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping Cloud repair lease DB test: set SOTTO_RUN_DB_TESTS=1");
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
+        let pool = crate::db::connect(&database_url).await.expect("connect");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let event_id = format!("evt_cloud_expired_repair_{}", Uuid::new_v4());
+        let account_id = format!("acct_cloud_expired_repair_{}", Uuid::new_v4());
+        record_coverage_rejection(
+            &pool,
+            &account_id,
+            ProviderEnvironment::Test,
+            &event_id,
+            "sponsored",
+            "sponsored_invoice_evidence_rejected",
+        )
+        .await
+        .expect("record rejection");
+        let fingerprint = rejection_fingerprint(
+            &account_id,
+            ProviderEnvironment::Test,
+            &event_id,
+            "sponsored",
+        );
+        let lease = claim_rejection(&pool, &fingerprint, &account_id, ProviderEnvironment::Test)
+            .await
+            .expect("claim repair");
+        finish_repair(&pool, &lease, "operator-1", "event_unavailable", false)
+            .await
+            .expect("record event outside provider history window");
+
+        let (state, outcome): (String, String) = sqlx::query_as(
+            "SELECT incident.state, action.outcome \
+             FROM cloud_coverage_rejection_incidents incident \
+             JOIN cloud_coverage_rejection_actions action USING (fingerprint) \
+             WHERE incident.fingerprint = $1",
+        )
+        .bind(&fingerprint)
+        .fetch_one(&pool)
+        .await
+        .expect("read unavailable event result");
+        assert_eq!(state, "unrecoverable");
+        assert_eq!(outcome, "event_unavailable");
+        assert!(
+            claim_rejection(&pool, &fingerprint, &account_id, ProviderEnvironment::Test)
+                .await
+                .is_err()
+        );
 
         sqlx::query("DELETE FROM cloud_coverage_rejection_actions WHERE fingerprint = $1")
             .bind(&fingerprint)

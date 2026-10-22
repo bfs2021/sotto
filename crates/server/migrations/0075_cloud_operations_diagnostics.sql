@@ -1,5 +1,6 @@
 -- Preserve paid invoices whose Cloud coverage evidence was permanently rejected. This record is
--- diagnostic and repairable; it never changes billing, coverage, eligibility, or retention state.
+-- diagnostic and repairable (or explicitly unrecoverable); it never changes billing, coverage,
+-- eligibility, or retention state.
 CREATE TABLE cloud_coverage_rejection_incidents (
     fingerprint          TEXT PRIMARY KEY CHECK (fingerprint ~ '^[0-9a-f]{64}$'),
     provider_account_id  TEXT NOT NULL CHECK (btrim(provider_account_id) <> ''),
@@ -9,7 +10,7 @@ CREATE TABLE cloud_coverage_rejection_incidents (
     coverage_kind         TEXT NOT NULL CHECK (coverage_kind IN ('personal', 'sponsored')),
     reason_code           TEXT NOT NULL CHECK (reason_code ~ '^[a-z][a-z0-9_]{0,63}$'),
     state                 TEXT NOT NULL DEFAULT 'open'
-                          CHECK (state IN ('open', 'repairing', 'resolved')),
+                          CHECK (state IN ('open', 'repairing', 'resolved', 'unrecoverable')),
     repair_attempt_count  INTEGER NOT NULL DEFAULT 0 CHECK (repair_attempt_count >= 0),
     repair_lease_token    TEXT,
     repair_lease_until    TIMESTAMPTZ,
@@ -38,7 +39,8 @@ CREATE TABLE cloud_coverage_rejection_actions (
         length(btrim(actor_label)) BETWEEN 1 AND 80 AND actor_label !~ '[[:cntrl:]]'
     ),
     outcome       TEXT NOT NULL CHECK (outcome IN (
-        'applied', 'already_applied', 'still_rejected', 'unresolved', 'provider_error'
+        'applied', 'already_applied', 'still_rejected', 'unresolved', 'provider_error',
+        'event_unavailable'
     )),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );

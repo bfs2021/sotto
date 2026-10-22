@@ -615,6 +615,11 @@ fn validate_cloud_operations_tokens<'a>(
         ));
     }
     for new_token in [metrics, repair].into_iter().flatten() {
+        if new_token.len() < 32 {
+            return Err(Error::Config(
+                "Cloud operations metrics and coverage repair tokens must contain at least 32 characters".into(),
+            ));
+        }
         if existing_write_tokens
             .into_iter()
             .flatten()
@@ -2147,20 +2152,24 @@ mod tests {
 
     #[test]
     fn cloud_diagnostic_credentials_cannot_share_existing_operator_tokens() {
+        let metrics = "m".repeat(32);
+        let repair = "r".repeat(32);
+        let shared = "s".repeat(32);
+        assert!(validate_cloud_operations_tokens(Some(&metrics), Some(&repair), [None; 5]).is_ok());
         assert!(
-            validate_cloud_operations_tokens(Some("metrics"), Some("repair"), [None; 5]).is_ok()
+            validate_cloud_operations_tokens(Some(&metrics), Some(&metrics), [None; 5]).is_err()
         );
-        assert!(validate_cloud_operations_tokens(Some("same"), Some("same"), [None; 5]).is_err());
+        assert!(validate_cloud_operations_tokens(Some("short"), None, [None; 5]).is_err());
         assert!(validate_cloud_operations_tokens(
-            Some("shared"),
+            Some(&shared),
             None,
-            [None, Some("shared"), None, None, None]
+            [None, Some(&shared), None, None, None]
         )
         .is_err());
         assert!(validate_cloud_operations_tokens(
             None,
-            Some("shared"),
-            [None, None, None, Some("shared"), None]
+            Some(&shared),
+            [None, None, None, Some(&shared), None]
         )
         .is_err());
     }

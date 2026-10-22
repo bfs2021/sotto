@@ -35,8 +35,8 @@ use crate::billing_refunds::{self, CorrectionReason, PayerKind};
 use crate::billing_transfers::{self, TransferPayer, TransferState};
 use crate::cloud_provider::{
     accept_provider_invalidation, record_verified_event, register_verified_allocation,
-    reject_verified_event, AllocationState, PayerKind as ProviderPayerKind, ProviderContext,
-    ProviderEnvironment, VerifiedAllocation,
+    reject_verified_event, reopen_rejected_event_for_repair, AllocationState,
+    PayerKind as ProviderPayerKind, ProviderContext, ProviderEnvironment, VerifiedAllocation,
 };
 use crate::cloud_provider_stripe::StripeCoverageConfig;
 use crate::cloud_provider_stripe::{
@@ -6867,7 +6867,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
             "invoice.paid" => {
-                invoice_paid(
+                let _ = invoice_paid(
                     &mut tx,
                     object,
                     event.created,
@@ -7363,6 +7363,24 @@ pub(crate) async fn repair_authenticated_stripe_event(
     prune_webhook_events(&mut tx).await?;
     let disposition = record_webhook_event(&mut tx, &event).await?;
     if disposition == EventDisposition::Ignore {
+        if let Some(sponsored) = sponsored_coverage.as_ref() {
+            let evidence = match sponsored {
+                SponsoredInvoiceCoveragePreparation::Prepared(prepared) => {
+                    Some((&prepared.context, &prepared.event))
+                }
+                SponsoredInvoiceCoveragePreparation::Rejected { context, event, .. } => {
+                    Some((context, event.as_ref()))
+                }
+                SponsoredInvoiceCoveragePreparation::NotApplicable => None,
+            };
+            if let Some((context, evidence)) = evidence {
+                reopen_rejected_event_for_repair(&mut tx, context, evidence)
+                    .await
+                    .map_err(|_| {
+                        Error::Internal("sponsored provider repair receipt changed".into())
+                    })?;
+            }
+        }
         if let Some(coverage) = &personal_coverage {
             accept_personal_invoice_coverage(
                 &mut tx,
@@ -7373,10 +7391,13 @@ pub(crate) async fn repair_authenticated_stripe_event(
             )
             .await?;
         }
+        let mut sponsored_rejection = None;
         if let Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) =
             sponsored_coverage.as_ref()
         {
-            accept_sponsored_invoice_coverage(&mut tx, prepared).await?;
+            if !accept_sponsored_invoice_coverage(&mut tx, prepared).await? {
+                sponsored_rejection = Some("sponsored_invoice_no_eligible_seats");
+            }
         }
         if let Some(SponsoredInvoiceCoveragePreparation::Rejected {
             context,
@@ -7385,6 +7406,7 @@ pub(crate) async fn repair_authenticated_stripe_event(
         }) = sponsored_coverage.as_ref()
         {
             reject_sponsored_invoice_coverage(&mut tx, context, event, reason).await?;
+            sponsored_rejection = Some(*reason);
         }
         tx.commit().await?;
         if (personal_coverage.is_some()
@@ -7393,6 +7415,7 @@ pub(crate) async fn repair_authenticated_stripe_event(
                 Some(SponsoredInvoiceCoveragePreparation::Prepared(_))
             ))
             && personal_rejection.is_none()
+            && sponsored_rejection.is_none()
             && !matches!(
                 sponsored_coverage.as_ref(),
                 Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
@@ -7426,22 +7449,25 @@ pub(crate) async fn repair_authenticated_stripe_event(
             }
             return Ok(StripeEventRepairDisposition::Rejected(reason));
         }
-        if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
-            sponsored_coverage.as_ref()
-        {
-            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
-                pool,
-                authenticated.account_id(),
-                authenticated.environment(),
-                authenticated.event_id(),
-                "sponsored",
-                reason,
-            )
-            .await
-            {
-                eprintln!(
-                    "error: failed to persist sponsored coverage rejection diagnostic: {error}"
-                );
+        if let Some(reason) = sponsored_rejection {
+            if matches!(
+                sponsored_coverage.as_ref(),
+                Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
+            ) {
+                if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+                    pool,
+                    authenticated.account_id(),
+                    authenticated.environment(),
+                    authenticated.event_id(),
+                    "sponsored",
+                    reason,
+                )
+                .await
+                {
+                    eprintln!(
+                        "error: failed to persist sponsored coverage rejection diagnostic: {error}"
+                    );
+                }
             }
             return Ok(StripeEventRepairDisposition::Rejected(reason));
         }
@@ -7460,7 +7486,7 @@ pub(crate) async fn repair_authenticated_stripe_event(
             "authenticated invoice event has an invalid disposition".into(),
         ));
     }
-    invoice_paid(
+    let sponsored_rejection = invoice_paid(
         &mut tx,
         &event.data.object,
         event.created,
@@ -7488,6 +7514,7 @@ pub(crate) async fn repair_authenticated_stripe_event(
             Some(SponsoredInvoiceCoveragePreparation::Prepared(_))
         ))
         && personal_rejection.is_none()
+        && sponsored_rejection.is_none()
         && !matches!(
             sponsored_coverage.as_ref(),
             Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
@@ -7523,24 +7550,26 @@ pub(crate) async fn repair_authenticated_stripe_event(
         );
         return Ok(StripeEventRepairDisposition::Rejected(reason));
     }
-    if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
-        sponsored_coverage.as_ref()
-    {
-        if let Err(error) = crate::cloud_operations::record_coverage_rejection(
-            pool,
-            authenticated.account_id(),
-            authenticated.environment(),
-            authenticated.event_id(),
-            "sponsored",
-            reason,
-        )
-        .await
-        {
-            eprintln!("error: failed to persist sponsored coverage rejection diagnostic: {error}");
+    if let Some(reason) = sponsored_rejection {
+        if matches!(
+            sponsored_coverage.as_ref(),
+            Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
+        ) {
+            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+                pool,
+                authenticated.account_id(),
+                authenticated.environment(),
+                authenticated.event_id(),
+                "sponsored",
+                reason,
+            )
+            .await
+            {
+                eprintln!(
+                    "error: failed to persist sponsored coverage rejection diagnostic: {error}"
+                );
+            }
         }
-        eprintln!(
-            "error: repaired Stripe invoice settled without sponsored Cloud coverage: {reason}"
-        );
         return Ok(StripeEventRepairDisposition::Rejected(reason));
     }
     Ok(StripeEventRepairDisposition::Applied)
@@ -9541,7 +9570,7 @@ async fn accept_personal_invoice_coverage(
 async fn accept_sponsored_invoice_coverage(
     tx: &mut Transaction<'_, Postgres>,
     prepared: &PreparedSponsoredInvoiceCoverage,
-) -> Result<()> {
+) -> Result<bool> {
     record_verified_event(tx, &prepared.context, &prepared.event)
         .await
         .map_err(|_| Error::Internal("sponsored provider event receipt failed".into()))?;
@@ -9651,8 +9680,18 @@ async fn accept_sponsored_invoice_coverage(
         )
         .await
         .map_err(|_| Error::Internal("sponsored provider evidence rejection failed".into()))?;
+        crate::cloud_operations::record_coverage_rejection_in_tx(
+            tx,
+            &prepared.context.account_id,
+            prepared.context.environment,
+            &prepared.event.event_id,
+            "sponsored",
+            "sponsored_invoice_no_eligible_seats",
+        )
+        .await?;
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn reject_sponsored_invoice_coverage(
@@ -11459,17 +11498,20 @@ async fn invoice_paid(
     catalogue: Option<&BillingPriceIds>,
     verified_personal_invoice: Option<&PreparedPersonalInvoiceCoverage>,
     verified_sponsored_invoice: Option<&SponsoredInvoiceCoveragePreparation>,
-) -> Result<()> {
+) -> Result<Option<&'static str>> {
     let Some(subscription_id) = invoice_subscription_id(object) else {
-        return Ok(());
+        return Ok(None);
     };
     if sponsored_billing_enabled() {
         let sponsored_organization =
             sponsored_invoice_paid(tx, object, subscription_id, event_created, catalogue).await?;
         if let Some(organization_id) = sponsored_organization {
+            let mut coverage_rejection = None;
             match verified_sponsored_invoice {
                 Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) => {
-                    accept_sponsored_invoice_coverage(tx, prepared).await?;
+                    if !accept_sponsored_invoice_coverage(tx, prepared).await? {
+                        coverage_rejection = Some("sponsored_invoice_no_eligible_seats");
+                    }
                     resolve_sponsored_renewal_failures(
                         tx,
                         &prepared.organization_id,
@@ -11485,6 +11527,7 @@ async fn invoice_paid(
                     reason,
                 }) => {
                     reject_sponsored_invoice_coverage(tx, context, event, reason).await?;
+                    coverage_rejection = Some(*reason);
                 }
                 Some(SponsoredInvoiceCoveragePreparation::NotApplicable) | None => {}
             }
@@ -11499,7 +11542,7 @@ async fn invoice_paid(
                 )
                 .await?;
             }
-            return Ok(());
+            return Ok(coverage_rejection);
         }
     }
     let personal_account: Option<(String, String)> = sqlx::query_as(
@@ -11510,7 +11553,7 @@ async fn invoice_paid(
     .fetch_optional(&mut **tx)
     .await?;
     let Some((personal_user_id, operation_id)) = personal_account else {
-        return Ok(());
+        return Ok(None);
     };
     let invoice_period_start = verified_personal_invoice
         .map(|evidence| evidence.period_start)
@@ -11605,7 +11648,7 @@ async fn invoice_paid(
     }
     reconcile_personal_founding_invoice(tx, object, subscription_id, catalogue).await?;
     enqueue_personal_renewal_recovered_notice(tx, object, subscription_id, event_created).await?;
-    Ok(())
+    Ok(None)
 }
 
 async fn reconcile_personal_founding_invoice(
