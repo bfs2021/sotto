@@ -95,10 +95,45 @@ class LifecycleManifest(unittest.TestCase):
                             test_env["DATABASE_URL"],
                             "postgres://sotto:p%40ss@localhost:5432/sotto_lifecycle_acceptance_deadbeef",
                         )
+                        self.assertEqual(test_env["SOTTO_TEST_DATABASE_PREFIX"], "lc_deadbeef")
                         raise RuntimeError("simulated test failure")
-        self.assertEqual([call[0][0] for call in calls], ["createdb", "dropdb"])
+        self.assertEqual([call[0][0] for call in calls], ["createdb", "psql", "dropdb"])
         self.assertNotIn("p@ss", " ".join(calls[0][0]))
         self.assertEqual(calls[0][1]["env"]["PGPASSWORD"], "p@ss")
+
+    def test_cleanup_drops_only_migration_databases_for_this_run(self):
+        calls = []
+
+        def utility(command, env):
+            calls.append(command)
+            output = "lc_deadbeef_upgrade_" + "a" * 32 + "\n"
+            return output if command[0] == "psql" else ""
+
+        with mock.patch.object(MODULE, "run_database_utility", side_effect=utility):
+            MODULE.cleanup_scenario_databases({}, "lc_deadbeef")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], "psql")
+        self.assertIn("lc_deadbeef_upgrade_", calls[0][5])
+        self.assertEqual(calls[1][-1], "lc_deadbeef_upgrade_" + "a" * 32)
+
+    def test_cleanup_reports_test_and_database_cleanup_failures(self):
+        env = {
+            "SOTTO_RUN_DB_TESTS": "1",
+            "DATABASE_URL": "postgres://localhost/sotto_lifecycle_acceptance",
+        }
+
+        def utility(command, env):
+            if command[0] == "psql":
+                return "lc_deadbeef_upgrade_" + "a" * 32
+            if command[0] == "dropdb":
+                raise RuntimeError("dropdb failed: drop failed")
+            return ""
+
+        with mock.patch.object(MODULE.secrets, "token_hex", return_value="deadbeef"):
+            with mock.patch.object(MODULE, "run_database_utility", side_effect=utility):
+                with self.assertRaisesRegex(RuntimeError, "simulated test failure.*cleanup also failed"):
+                    with MODULE.disposable_acceptance_database(env):
+                        raise RuntimeError("simulated test failure")
 
     def test_database_cleanup_failure_is_reported(self):
         env = {
