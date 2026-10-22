@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use axum::{middleware, Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -497,28 +497,6 @@ pub async fn record_coverage_rejection(
     coverage_kind: &str,
     reason_code: &str,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    record_coverage_rejection_in_tx(
-        &mut tx,
-        account_id,
-        environment,
-        event_id,
-        coverage_kind,
-        reason_code,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-pub async fn record_coverage_rejection_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    account_id: &str,
-    environment: ProviderEnvironment,
-    event_id: &str,
-    coverage_kind: &str,
-    reason_code: &str,
-) -> Result<()> {
     if !matches!(coverage_kind, "personal" | "sponsored") || event_id.trim().is_empty() {
         return Err(Error::Internal(
             "invalid coverage rejection evidence".into(),
@@ -540,7 +518,7 @@ pub async fn record_coverage_rejection_in_tx(
     .bind(event_id)
     .bind(coverage_kind)
     .bind(reason_code)
-    .execute(&mut **tx)
+    .execute(pool)
     .await?;
     Ok(())
 }

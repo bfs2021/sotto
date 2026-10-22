@@ -6689,6 +6689,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     } else {
         (None, None)
     };
+    let mut sponsored_rejection = None;
     // A transfer destination subscription may not yet be linked to the personal account. Do not
     // persist that association from webhook metadata alone: wait until the invoice and its
     // payment have been read back from Stripe and their period, price and binding all agree.
@@ -6867,7 +6868,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
             "invoice.paid" => {
-                let _ = invoice_paid(
+                sponsored_rejection = invoice_paid(
                     &mut tx,
                     object,
                     event.created,
@@ -6978,9 +6979,11 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             event.id, reason
         );
     }
-    if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
-        sponsored_coverage.as_ref()
-    {
+    let sponsored_rejection = sponsored_rejection.or(match sponsored_coverage.as_ref() {
+        Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) => Some(*reason),
+        _ => None,
+    });
+    if let Some(reason) = sponsored_rejection {
         if let Some((coverage, _)) = billing.personal_coverage() {
             if let Err(error) = crate::cloud_operations::record_coverage_rejection(
                 &state.pool,
@@ -7450,24 +7453,19 @@ pub(crate) async fn repair_authenticated_stripe_event(
             return Ok(StripeEventRepairDisposition::Rejected(reason));
         }
         if let Some(reason) = sponsored_rejection {
-            if matches!(
-                sponsored_coverage.as_ref(),
-                Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
-            ) {
-                if let Err(error) = crate::cloud_operations::record_coverage_rejection(
-                    pool,
-                    authenticated.account_id(),
-                    authenticated.environment(),
-                    authenticated.event_id(),
-                    "sponsored",
-                    reason,
-                )
-                .await
-                {
-                    eprintln!(
-                        "error: failed to persist sponsored coverage rejection diagnostic: {error}"
-                    );
-                }
+            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+                pool,
+                authenticated.account_id(),
+                authenticated.environment(),
+                authenticated.event_id(),
+                "sponsored",
+                reason,
+            )
+            .await
+            {
+                eprintln!(
+                    "error: failed to persist sponsored coverage rejection diagnostic: {error}"
+                );
             }
             return Ok(StripeEventRepairDisposition::Rejected(reason));
         }
@@ -7551,24 +7549,17 @@ pub(crate) async fn repair_authenticated_stripe_event(
         return Ok(StripeEventRepairDisposition::Rejected(reason));
     }
     if let Some(reason) = sponsored_rejection {
-        if matches!(
-            sponsored_coverage.as_ref(),
-            Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
-        ) {
-            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
-                pool,
-                authenticated.account_id(),
-                authenticated.environment(),
-                authenticated.event_id(),
-                "sponsored",
-                reason,
-            )
-            .await
-            {
-                eprintln!(
-                    "error: failed to persist sponsored coverage rejection diagnostic: {error}"
-                );
-            }
+        if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+            pool,
+            authenticated.account_id(),
+            authenticated.environment(),
+            authenticated.event_id(),
+            "sponsored",
+            reason,
+        )
+        .await
+        {
+            eprintln!("error: failed to persist sponsored coverage rejection diagnostic: {error}");
         }
         return Ok(StripeEventRepairDisposition::Rejected(reason));
     }
@@ -9680,15 +9671,6 @@ async fn accept_sponsored_invoice_coverage(
         )
         .await
         .map_err(|_| Error::Internal("sponsored provider evidence rejection failed".into()))?;
-        crate::cloud_operations::record_coverage_rejection_in_tx(
-            tx,
-            &prepared.context.account_id,
-            prepared.context.environment,
-            &prepared.event.event_id,
-            "sponsored",
-            "sponsored_invoice_no_eligible_seats",
-        )
-        .await?;
         return Ok(false);
     }
     Ok(true)
