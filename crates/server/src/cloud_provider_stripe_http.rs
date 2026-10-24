@@ -308,6 +308,16 @@ impl StripeReadClient {
         if api_key.trim().is_empty() {
             return Err(StripeReadError::InvalidConfig("Stripe API key"));
         }
+        let key_livemode = if api_key.starts_with("sk_live_") || api_key.starts_with("rk_live_") {
+            Some(true)
+        } else if api_key.starts_with("sk_test_") || api_key.starts_with("rk_test_") {
+            Some(false)
+        } else {
+            None
+        };
+        if key_livemode != Some(matches!(config.environment, ProviderEnvironment::Live)) {
+            return Err(StripeReadError::InvalidConfig("Stripe API key environment"));
+        }
         let limits = limits.validate()?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -367,15 +377,13 @@ impl StripeReadClient {
         if id != self.account_id {
             return Err(StripeReadError::AccountMismatch);
         }
-        let livemode = value
-            .get("livemode")
-            .and_then(Value::as_bool)
-            .ok_or(StripeReadError::MalformedResponse("account.livemode"))?;
-        if livemode != matches!(self.environment, ProviderEnvironment::Live) {
-            return Err(StripeReadError::ContextMismatch);
-        }
         session.account_verified = true;
-        Ok(StripeAccountResource { id, livemode })
+        // Stripe's Account object has no `livemode` field. The key prefix is the authoritative
+        // mode signal; `build` rejects a key whose mode differs from the configured environment.
+        Ok(StripeAccountResource {
+            id,
+            livemode: matches!(self.environment, ProviderEnvironment::Live),
+        })
     }
 
     pub async fn subscription(

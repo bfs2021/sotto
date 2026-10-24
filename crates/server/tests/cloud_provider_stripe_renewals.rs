@@ -286,7 +286,7 @@ async fn sponsored_failure_read_ignores_a_late_event_for_a_closed_invoice() {
     let server = mock_server(HashMap::from([
         (
             "/v1/account".into(),
-            vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+            vec![json!({"id":"acct_test_renewal","object":"account"})],
         ),
         (
             "/v1/invoices/in_sponsored_closed".into(),
@@ -365,7 +365,7 @@ async fn history_with_line(line: Value) -> StripePersonalInvoiceHistory {
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
-        vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+        vec![json!({"id":"acct_test_renewal","object":"account"})],
     );
     responses.insert(
         "/v1/subscriptions/sub_renewal".into(),
@@ -438,7 +438,7 @@ async fn history_with_current_invoice(line: Value) -> StripePersonalInvoiceHisto
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
-        vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+        vec![json!({"id":"acct_test_renewal","object":"account"})],
     );
     responses.insert(
         "/v1/subscriptions/sub_renewal".into(),
