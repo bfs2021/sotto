@@ -413,7 +413,12 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}");
-        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        // Stripe marks amount_paid_off_stripe as includable rather than returning it by
+        // default. We require it to distinguish Stripe settlements from off-Stripe payment.
+        let query = [("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())];
+        let value = self
+            .request_json(session, Method::GET, &path, &query)
+            .await?;
         let resource = parse_invoice(&value)?;
         if resource.id != invoice_id {
             return Err(StripeReadError::ContextMismatch);

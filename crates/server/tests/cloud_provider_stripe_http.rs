@@ -1676,6 +1676,15 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
     assert!(invoice_list_calls
         .iter()
         .any(|call| call.path_and_query.contains("starting_after=in_2")));
+    let invoice_detail_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
+        .collect();
+    assert_eq!(invoice_detail_calls.len(), 1);
+    assert_eq!(
+        query_pairs(invoice_detail_calls[0]),
+        vec![("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())]
+    );
 }
 
 #[tokio::test]
