@@ -1564,18 +1564,18 @@ async fn bounded_subscription_invoice_reads_stop_before_fetching_unbounded_histo
         .unwrap()
         .iter()
         .filter(|call| call.path_and_query.starts_with("/v1/invoices?"))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(invoice_calls.len(), 1);
-    assert!(query_pairs(&invoice_calls[0]).contains(&(
-        "expand[]".to_owned(),
-        "data.amount_paid_off_stripe".to_owned()
-    )));
+        .count();
+    assert_eq!(invoice_calls, 1);
 }
 
 #[tokio::test]
 async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_states() {
     let mut responses = HashMap::new();
+    let mut paid_invoice_summary = paid_invoice();
+    paid_invoice_summary
+        .as_object_mut()
+        .expect("invoice fixture is an object")
+        .remove("amount_paid_off_stripe");
     responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
     responses.insert(
         "/v1/subscriptions/sub_1".into(),
@@ -1587,7 +1587,7 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
         "/v1/invoices".into(),
         vec![
             MockResponse::json(list(
-                vec![paid_invoice(), {
+                vec![paid_invoice_summary, {
                     let mut invoice = non_paid_invoice("in_2", "open");
                     invoice["parent"]["subscription_details"]["subscription"] =
                         json!({"id":"sub_1"});
@@ -1678,12 +1678,6 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
         .iter()
         .all(|call| call.path_and_query.contains("subscription=sub_1")
             && call.path_and_query.contains("customer=cus_1")));
-    assert!(invoice_list_calls
-        .iter()
-        .all(|call| query_pairs(call).contains(&(
-            "expand[]".to_owned(),
-            "data.amount_paid_off_stripe".to_owned()
-        ))));
     assert!(invoice_list_calls
         .iter()
         .any(|call| call.path_and_query.contains("starting_after=in_2")));
@@ -2010,8 +2004,7 @@ async fn invoice_history_detects_a_paid_header_change_during_assembly() {
     );
     let listed = paid_invoice();
     let mut detailed = paid_invoice();
-    detailed["amount_paid"] = json!(298);
-    detailed["amount_due"] = json!(298);
+    detailed["amount_paid_off_stripe"] = json!(1);
     responses.insert(
         "/v1/invoices".into(),
         vec![MockResponse::json(list(vec![listed], false))],
