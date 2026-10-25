@@ -40,7 +40,8 @@ use crate::cloud_provider::{
 };
 use crate::cloud_provider_stripe::StripeCoverageConfig;
 use crate::cloud_provider_stripe::{
-    decode_paid_invoice, decode_paid_invoice_from_authenticated_read, StripeAllocationBinding,
+    decode_paid_invoice_from_authenticated_read_with_observation,
+    decode_paid_invoice_with_observation, StripeAllocationBinding,
 };
 use crate::cloud_provider_stripe_event_repair::StripeEventRepairDisposition;
 use crate::cloud_provider_stripe_http::{AuthenticatedStripeEvent, StripeReadClient};
@@ -9329,21 +9330,25 @@ async fn prepare_personal_invoice_coverage(
         }
     };
     let decoded = match source {
-        PersonalInvoiceEventSource::Signed { signature, now } => decode_paid_invoice(
-            raw_event.as_bytes(),
-            signature,
-            &billing.webhook_secret,
-            now,
-            coverage_config,
-            &binding,
-            &settlement,
-        ),
+        PersonalInvoiceEventSource::Signed { signature, now } => {
+            decode_paid_invoice_with_observation(
+                raw_event.as_bytes(),
+                signature,
+                &billing.webhook_secret,
+                now,
+                coverage_config,
+                &binding,
+                &settlement,
+                &observation,
+            )
+        }
         PersonalInvoiceEventSource::AuthenticatedRead(event) => {
-            decode_paid_invoice_from_authenticated_read(
+            decode_paid_invoice_from_authenticated_read_with_observation(
                 event,
                 coverage_config,
                 &binding,
                 &settlement,
+                &observation,
             )
         }
     };
