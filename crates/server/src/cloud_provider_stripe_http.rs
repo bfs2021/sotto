@@ -345,6 +345,7 @@ impl StripeReadClient {
             pages: 0,
             records: 0,
             account_verified: false,
+            last_permission_scope: None,
             identity: Arc::clone(&self.identity),
         }
     }
@@ -1780,7 +1781,13 @@ impl StripeReadClient {
             request = request.query(query);
         }
         let response = request.send().await.map_err(map_request_error)?;
-        self.read_response(session, response).await
+        match self.read_response(session, response).await {
+            Err(error @ StripeReadError::Permission { .. }) => {
+                session.last_permission_scope = Some(safe_permission_scope(path));
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     async fn read_response(
@@ -1836,6 +1843,7 @@ pub struct StripeReadSession {
     pages: usize,
     records: usize,
     account_verified: bool,
+    last_permission_scope: Option<&'static str>,
     identity: Arc<()>,
 }
 
@@ -1853,6 +1861,14 @@ impl fmt::Debug for StripeReadSession {
 }
 
 impl StripeReadSession {
+    /// Return the fixed endpoint category for the most recent 403 response.
+    ///
+    /// This diagnostic omits request paths and resource identifiers.
+    #[doc(hidden)]
+    pub fn last_permission_scope(&self) -> Option<&'static str> {
+        self.last_permission_scope
+    }
+
     fn remaining(&self) -> Result<Duration, StripeReadError> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -1902,6 +1918,24 @@ impl StripeReadSession {
             return Err(StripeReadError::RecordBoundExceeded);
         }
         Ok(())
+    }
+}
+
+fn safe_permission_scope(path: &str) -> &'static str {
+    match path {
+        "v1/account" => "account",
+        "v1/invoices" => "invoice_list",
+        "v1/invoice_payments" => "invoice_payments",
+        "v1/refunds" => "refunds",
+        "v1/disputes" => "disputes",
+        "v1/credit_notes" => "credit_notes",
+        "v1/events" => "events",
+        "v1/prices" => "prices",
+        "v1/products" => "products",
+        path if path.starts_with("v1/invoices/") && path.ends_with("/lines") => "invoice_lines",
+        path if path.starts_with("v1/invoices/") => "invoice_detail",
+        path if path.starts_with("v1/subscriptions/") => "subscriptions",
+        _ => "other_stripe_read",
     }
 }
 
@@ -3390,7 +3424,24 @@ fn map_request_error(error: reqwest::Error) -> StripeReadError {
 
 #[cfg(test)]
 mod invoice_summary_tests {
-    use super::parse_invoice;
+    use super::{parse_invoice, safe_permission_scope};
+
+    #[test]
+    fn permission_scope_diagnostics_never_include_resource_identifiers() {
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123/lines"),
+            "invoice_lines"
+        );
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123"),
+            "invoice_detail"
+        );
+        assert_eq!(safe_permission_scope("v1/refunds"), "refunds");
+        assert_eq!(
+            safe_permission_scope("v1/unrecognised/resource_456"),
+            "other_stripe_read"
+        );
+    }
 
     #[test]
     fn invoice_list_summary_marks_complete_line_data_for_candidate_filtering() {

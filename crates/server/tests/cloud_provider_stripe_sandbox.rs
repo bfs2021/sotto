@@ -185,10 +185,16 @@ async fn reads_the_configured_stripe_test_contract_without_mutation() {
         "sandbox returned an unsupported subscription status"
     );
 
-    let history = client
+    let history = match client
         .personal_invoice_history(&mut session, &binding)
         .await
-        .expect("read configured Stripe invoice history");
+    {
+        Ok(history) => history,
+        Err(error) => panic!(
+            "read configured Stripe invoice history: {error}; permission scope: {:?}",
+            session.last_permission_scope()
+        ),
+    };
     let history = match history {
         StripePersonalInvoiceHistoryResult::Observed(history) => history,
         StripePersonalInvoiceHistoryResult::NeedsEvidence(needs) => panic!(

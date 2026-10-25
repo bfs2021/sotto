@@ -2390,6 +2390,7 @@ async fn rejects_wrong_account_key_mode_redirect_and_invalid_pagination() {
         client.account(&mut session).await,
         Err(StripeReadError::Permission { status: 403 })
     ));
+    assert_eq!(session.last_permission_scope(), Some("account"));
 }
 
 #[tokio::test]
