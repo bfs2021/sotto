@@ -637,6 +637,12 @@ impl StripeReadClient {
         if let Some(customer_id) = customer_id {
             query.push(("customer".to_owned(), customer_id.to_owned()));
         }
+        // The history reader compares this summary with an expanded invoice detail read. Expand
+        // the includable field in list data too, otherwise `None` here looks like invoice drift.
+        query.push((
+            "expand[]".to_owned(),
+            "data.amount_paid_off_stripe".to_owned(),
+        ));
         let invoices = self
             .list(session, "v1/invoices", query, parse_invoice)
             .await?;
@@ -669,6 +675,11 @@ impl StripeReadClient {
         if let Some(customer_id) = customer_id {
             query.push(("customer".to_owned(), customer_id.to_owned()));
         }
+        // Keep the bounded and unbounded invoice summaries equivalent for history comparisons.
+        query.push((
+            "expand[]".to_owned(),
+            "data.amount_paid_off_stripe".to_owned(),
+        ));
         let invoices = self
             .list_bounded(session, "v1/invoices", query, parse_invoice, max_invoices)
             .await?;

@@ -1564,8 +1564,13 @@ async fn bounded_subscription_invoice_reads_stop_before_fetching_unbounded_histo
         .unwrap()
         .iter()
         .filter(|call| call.path_and_query.starts_with("/v1/invoices?"))
-        .count();
-    assert_eq!(invoice_calls, 1);
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(invoice_calls.len(), 1);
+    assert!(query_pairs(&invoice_calls[0]).contains(&(
+        "expand[]".to_owned(),
+        "data.amount_paid_off_stripe".to_owned()
+    )));
 }
 
 #[tokio::test]
@@ -1673,6 +1678,12 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
         .iter()
         .all(|call| call.path_and_query.contains("subscription=sub_1")
             && call.path_and_query.contains("customer=cus_1")));
+    assert!(invoice_list_calls
+        .iter()
+        .all(|call| query_pairs(call).contains(&(
+            "expand[]".to_owned(),
+            "data.amount_paid_off_stripe".to_owned()
+        ))));
     assert!(invoice_list_calls
         .iter()
         .any(|call| call.path_and_query.contains("starting_after=in_2")));
