@@ -276,6 +276,55 @@ jobs:
             fi
           fi
 
+  cloud-scenarios:
+    # These used to run at the end of the coverage job. Coverage never measured them, and that job
+    # caches only its instrumented build, so running them there meant a full cold compile on every
+    # pull request. Here they run alongside the rest of CI against a cached build.
+    name: cloud database scenarios
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sotto
+          POSTGRES_PASSWORD: sotto
+          POSTGRES_DB: sotto
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sotto"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      SOTTO_RUN_DB_TESTS: "1"
+      SOTTO_TELEMETRY: "off"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the server test binaries
+        # Both runners give every cargo command a fixed timeout, starting with test discovery.
+        # Compiling inside that window would turn a slow build into a reported scenario failure,
+        # so the build happens first and the timeouts measure only the tests.
+        run: cargo test -p sotto-server --no-run
+      - name: Cloud coverage race repetitions
+        run: scripts/check-cloud-coverage-races
+      - name: Install PostgreSQL client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends postgresql-client
+      - name: Integrated Cloud lifecycle database scenarios
+        run: |
+          DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto_lifecycle_acceptance \
+            scripts/check-cloud-lifecycle-integration
+
   funnel-e2e:
     name: funnel regression suite (Launch gate 4)
     runs-on: ubuntu-24.04
@@ -402,7 +451,7 @@ jobs:
   assurance-complete:
     name: ci assurance complete
     if: always()
-    needs: [test, core-platform, readme-i18n, action-consumer, wasm, web, server, funnel-e2e, supply-chain]
+    needs: [test, core-platform, readme-i18n, action-consumer, wasm, web, server, cloud-scenarios, funnel-e2e, supply-chain]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

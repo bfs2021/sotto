@@ -65,16 +65,6 @@ jobs:
           set -euo pipefail
           cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
           grep -Eq '^SERVER_ASSURANCE_DONE 7$' server-assurance.log
-      - name: Cloud coverage race repetitions
-        run: scripts/check-cloud-coverage-races
-      - name: Install PostgreSQL client tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends postgresql-client
-      - name: Integrated Cloud lifecycle database scenarios
-        run: |
-          DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto_lifecycle_acceptance \
-            scripts/check-cloud-lifecycle-integration
       - name: Publish coverage summary
         run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Retain reports and run status
