@@ -28,7 +28,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        # The server job runs the server and CLI suites against Postgres, so running them here as
+        # well only repeated them with the database tests skipped. Clippy above still compiles
+        # every target of every crate.
+        run: cargo test --workspace --exclude sotto-server --exclude sotto-cli
 
   core-platform:
     name: Core codec (${{ matrix.os }})
