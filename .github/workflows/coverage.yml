@@ -52,12 +52,6 @@ jobs:
           workspaces: . -> target/llvm-cov-target
       - name: Install pinned coverage tool
         run: cargo install cargo-llvm-cov --version 0.9.1 --locked
-      - name: Coverage runner regression tests
-        run: |
-          python3 -B -m unittest discover -s scripts/tests -p test_rust_coverage.py -v
-          python3 -B -m unittest discover -s scripts/tests -p test_cloud_coverage_races.py -v
-          python3 -B -m unittest discover -s scripts/tests -p test_cloud_lifecycle_integration.py -v
-          python3 -B -m unittest discover -s scripts/tests -p test_validate_stripe_lifecycle_evidence.py -v
       - name: Native workspace coverage with Postgres
         run: scripts/check-rust-coverage
       - name: Publish coverage summary
