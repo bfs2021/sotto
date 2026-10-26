@@ -9854,62 +9854,77 @@ fn personal_renewal_notice_event_key(
 async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) -> Result<bool> {
     let invoice = &event.data.object;
     let Some(subscription_id) = invoice_subscription_id_claim(invoice) else {
+        log_personal_renewal_notice_skip("subscription_missing");
         return Ok(false);
     };
     let Some(invoice_id) = invoice["id"].as_str().filter(|value| !value.is_empty()) else {
+        log_personal_renewal_notice_skip("invoice_id_missing");
         return Ok(false);
     };
     let Some(customer_id) = stripe_reference(&invoice["customer"]) else {
+        log_personal_renewal_notice_skip("customer_missing");
         return Ok(false);
     };
     let Some(period_start) = invoice_period_start(invoice)
         .and_then(|value| FoundingDate::from_unix_seconds(value).ok())
         .map(|value| value.to_unix_seconds())
     else {
+        log_personal_renewal_notice_skip("period_start_missing_or_invalid");
         return Ok(false);
     };
-    if invoice["object"].as_str() != Some("invoice")
-        || invoice["billing_reason"].as_str() != Some("subscription_cycle")
-        || invoice["collection_method"].as_str() != Some("charge_automatically")
-        || invoice["status"].as_str() != Some("open")
-        || invoice["amount_remaining"]
-            .as_i64()
-            .is_none_or(|amount| amount <= 0)
+    let shape_skip_reason = if invoice["object"].as_str() != Some("invoice") {
+        Some("not_an_invoice")
+    } else if invoice["billing_reason"].as_str() != Some("subscription_cycle") {
+        Some("not_a_subscription_cycle")
+    } else if invoice["collection_method"].as_str() != Some("charge_automatically") {
+        Some("not_automatic_collection")
+    } else if invoice["status"].as_str() != Some("open") {
+        Some("invoice_not_open")
+    } else if invoice["amount_remaining"]
+        .as_i64()
+        .is_none_or(|amount| amount <= 0)
     {
+        Some("amount_remaining_not_positive")
+    } else {
+        None
+    };
+    if let Some(reason) = shape_skip_reason {
+        log_personal_renewal_notice_skip(reason);
         return Ok(false);
     }
 
     let mut tx = pool.begin().await?;
     prune_webhook_events(&mut tx).await?;
     let disposition = record_webhook_event(&mut tx, event).await?;
-    if disposition == EventDisposition::Ignore {
-        tx.commit().await?;
-        return Ok(true);
-    }
-
-    let account = sqlx::query(
-        "SELECT user_id, paid_through_epoch, state FROM billing_personal_accounts \
-         WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
-           AND state IN ('active','past_due','unpaid') FOR UPDATE",
-    )
-    .bind(&subscription_id)
-    .bind(&customer_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(account) = account {
-        let user_id: String = account.try_get("user_id")?;
-        let paid_through: Option<i64> = account.try_get("paid_through_epoch")?;
-        if let Some(paid_through) =
-            paid_through.filter(|paid_through| period_start >= *paid_through)
-        {
-            let deadline = paid_through
-                .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
-                .ok_or_else(|| Error::Internal("personal recovery deadline overflowed".into()))?;
-            let due_at_epoch: i64 =
-                sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
-                    .fetch_one(&mut *tx)
-                    .await?;
-            let intent = crate::notifications::NoticeIntent {
+    let outcome = if disposition == EventDisposition::Ignore {
+        PersonalRenewalNoticeOutcome::WebhookAlreadyProcessed
+    } else {
+        let account = sqlx::query(
+            "SELECT user_id, paid_through_epoch, state FROM billing_personal_accounts \
+             WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
+               AND state IN ('active','past_due','unpaid') FOR UPDATE",
+        )
+        .bind(&subscription_id)
+        .bind(&customer_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(account) = account {
+            let user_id: String = account.try_get("user_id")?;
+            let paid_through: Option<i64> = account.try_get("paid_through_epoch")?;
+            if let Some(paid_through) = paid_through {
+                if period_start < paid_through {
+                    PersonalRenewalNoticeOutcome::Skipped("invoice_period_precedes_paid_through")
+                } else {
+                    let deadline = paid_through
+                        .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
+                        .ok_or_else(|| {
+                            Error::Internal("personal recovery deadline overflowed".into())
+                        })?;
+                    let due_at_epoch: i64 =
+                        sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    let intent = crate::notifications::NoticeIntent {
                 recipient_user_id: user_id.clone(),
                 event_key: personal_renewal_notice_event_key(
                     &user_id,
@@ -9931,13 +9946,58 @@ async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) ->
                     price_interval: None,
                 },
             };
-            crate::notifications::enqueue_in_tx(&mut tx, &intent)
-                .await
-                .map_err(notification_error)?;
+                    let outcome = crate::notifications::enqueue_in_tx(&mut tx, &intent)
+                        .await
+                        .map_err(notification_error)?;
+                    match outcome {
+                        crate::notifications::EnqueueOutcome::Enqueued => {
+                            PersonalRenewalNoticeOutcome::Enqueued
+                        }
+                        crate::notifications::EnqueueOutcome::AlreadyQueued => {
+                            PersonalRenewalNoticeOutcome::AlreadyQueued
+                        }
+                    }
+                }
+            } else {
+                PersonalRenewalNoticeOutcome::Skipped("paid_through_missing")
+            }
+        } else {
+            PersonalRenewalNoticeOutcome::Skipped("personal_account_binding_not_found")
+        }
+    };
+    tx.commit().await?;
+    log_personal_renewal_notice_outcome(outcome);
+    Ok(matches!(
+        outcome,
+        PersonalRenewalNoticeOutcome::WebhookAlreadyProcessed
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum PersonalRenewalNoticeOutcome {
+    Skipped(&'static str),
+    Enqueued,
+    AlreadyQueued,
+    WebhookAlreadyProcessed,
+}
+
+fn log_personal_renewal_notice_skip(reason: &'static str) {
+    eprintln!("warning: skipped personal renewal failure notice: {reason}");
+}
+
+fn log_personal_renewal_notice_outcome(outcome: PersonalRenewalNoticeOutcome) {
+    match outcome {
+        PersonalRenewalNoticeOutcome::Skipped(reason) => log_personal_renewal_notice_skip(reason),
+        PersonalRenewalNoticeOutcome::Enqueued => {
+            eprintln!("warning: queued personal renewal failure notice");
+        }
+        PersonalRenewalNoticeOutcome::AlreadyQueued => {
+            eprintln!("warning: personal renewal failure notice was already queued");
+        }
+        PersonalRenewalNoticeOutcome::WebhookAlreadyProcessed => {
+            eprintln!("warning: personal renewal failure webhook was already processed");
         }
     }
-    tx.commit().await?;
-    Ok(false)
 }
 
 fn notification_error(error: crate::notifications::NoticeError) -> Error {
