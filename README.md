@@ -170,7 +170,7 @@ reusable-workflow examples.
 
 Want a runnable demo? [**sotto-example**](https://github.com/getsotto/sotto-example)
 walks through local secret injection with a Python GIF and copyable steps, plus tiny examples
-in JavaScript, TypeScript, Java, C#, PHP, Go, and C++. No account required; instructions cover
+in JavaScript, TypeScript, Java, C#, PHP, Go, Rust, and C++. No account required; instructions cover
 macOS, Linux, and Windows.
 
 ```sh

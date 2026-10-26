@@ -175,7 +175,7 @@ matrices, Windows et workflows réutilisables.
 
 Envie d'une démo fonctionnelle ? [**sotto-example**](https://github.com/getsotto/sotto-example)
 présente l'injection locale de secrets avec un GIF Python et des étapes copiables, plus de petits exemples
-en JavaScript, TypeScript, Java, C#, PHP, Go et C++. Aucun compte requis ; les instructions couvrent
+en JavaScript, TypeScript, Java, C#, PHP, Go, Rust et C++. Aucun compte requis ; les instructions couvrent
 macOS, Linux et Windows.
 
 ```sh

@@ -172,7 +172,7 @@ Matrix-, Windows- und Reusable-Workflow-Beispiele.
 
 Lust auf eine lauffähige Demo? [**sotto-example**](https://github.com/getsotto/sotto-example)
 zeigt lokale Secret-Injektion mit einem Python-GIF und kopierbaren Schritten, plus winzige Beispiele
-in JavaScript, TypeScript, Java, C#, PHP, Go und C++. Kein Konto erforderlich; die Anleitungen decken
+in JavaScript, TypeScript, Java, C#, PHP, Go, Rust und C++. Kein Konto erforderlich; die Anleitungen decken
 macOS, Linux und Windows ab.
 
 ```sh

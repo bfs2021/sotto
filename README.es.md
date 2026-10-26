@@ -173,7 +173,7 @@ para ejemplos de matrices, Windows y flujos reutilizables.
 
 ¿Quieres una demo funcional? [**sotto-example**](https://github.com/getsotto/sotto-example)
 muestra la inyección local de secretos con un GIF de Python y pasos copiables, además de pequeños ejemplos
-en JavaScript, TypeScript, Java, C#, PHP, Go y C++. No necesitas cuenta; las instrucciones cubren
+en JavaScript, TypeScript, Java, C#, PHP, Go, Rust y C++. No necesitas cuenta; las instrucciones cubren
 macOS, Linux y Windows.
 
 ```sh
