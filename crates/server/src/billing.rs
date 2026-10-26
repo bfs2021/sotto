@@ -9865,9 +9865,9 @@ async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) ->
         log_personal_renewal_notice_skip("customer_missing");
         return Ok(false);
     };
+    // `paid_through_epoch` retains Stripe's time of day, so compare the exact line boundary.
     let Some(period_start) = invoice_period_start(invoice)
-        .and_then(|value| FoundingDate::from_unix_seconds(value).ok())
-        .map(|value| value.to_unix_seconds())
+        .filter(|value| FoundingDate::from_unix_seconds(*value).is_ok())
     else {
         log_personal_renewal_notice_skip("period_start_missing_or_invalid");
         return Ok(false);

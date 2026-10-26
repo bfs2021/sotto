@@ -1290,9 +1290,9 @@ async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoic
     let late_failure_event = format!("evt_notice_late_failure_{fixture}");
     seed_user(&pool, &user_id).await;
     let operation_id = seed_personal_account(&pool, &user_id, &operation_key).await;
-    let paid_through = FoundingDate::from_unix_seconds(1_900_000_000)
-        .expect("valid paid-through date")
-        .to_unix_seconds();
+    // Stripe period boundaries preserve their exact time of day. Keep this boundary off
+    // midnight so the notice path cannot accidentally round it back to a calendar date.
+    let paid_through = 1_900_000_000;
     sqlx::query(
         "UPDATE billing_personal_accounts SET state='active', stripe_customer_id=$2, \
            stripe_subscription_id=$3, paid_through_epoch=$4, paid_through_date=$5 \
