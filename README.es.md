@@ -293,6 +293,36 @@ Para recuperar un valor anterior, consulta [Restaurar una versión anterior de u
 Ese historial procede del servidor, así que solo sirve para valores que ya habías subido. Ejecuta
 `sotto import --help` para ver las reglas de comillas y de valores literales en lugar de repetirlas aquí.
 
+### Eliminar un secreto
+
+Para eliminar un secreto obsoleto de `staging` sin cambiar el entorno predeterminado:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` elimina el secreto del entorno seleccionado en el almacén local.
+`sotto push` sincroniza la eliminación con el servidor después de `sotto login`;
+ejecuta `sotto pull` para ese mismo entorno en otro dispositivo para recibir el cambio.
+Ejecuta el último comando en el otro dispositivo, no en el que eliminó el secreto.
+
+En un terminal interactivo, `sotto rm` sin nombre abre el selector de secretos.
+Después se solicita confirmación, con No como opción predeterminada; cancelar o
+rechazar deja el secreto intacto. `--yes` (o `-y`) omite la confirmación, pero
+no evita el selector si falta el nombre ni una solicitud de desbloqueo necesaria.
+
+Las solicitudes interactivas requieren que stdin, stdout y stderr sean terminales,
+que `TERM` no sea «dumb» y que `CI` no esté activo. En un entorno no interactivo
+se debe indicar el nombre; la eliminación con nombre no pide confirmación aunque
+no se incluya `--yes`.
+
+Los secretos eliminados desaparecen de las lecturas y listas habituales, pero
+se conserva su historial de versiones. No es un borrado seguro ni revoca la
+credencial en su proveedor externo. Para recuperarla, usa `sotto history`
+y `sotto rollback`.
+
 ### Compartir un secreto
 
 `sotto share` cifra un secreto en un enlace de un solo uso. La clave va después del `#` del enlace,

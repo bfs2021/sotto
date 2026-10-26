@@ -293,6 +293,37 @@ Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wied
 Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
 `sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
 
+### Ein Secret entfernen
+
+Um ein veraltetes Secret aus `staging` zu entfernen, ohne die Standardumgebung zu ändern:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` entfernt das Secret aus der gewählten Umgebung im lokalen Tresor.
+`sotto push` synchronisiert die Entfernung nach `sotto login` mit dem Server.
+Führe `sotto pull` für dieselbe Umgebung auf einem anderen Gerät aus, um die
+Entfernung zu übernehmen. Der letzte Befehl gehört auf das andere Gerät.
+
+Im interaktiven Terminal öffnet `sotto rm` ohne Namen die Secret-Auswahl.
+Danach wird eine Bestätigung abgefragt, wobei Nein voreingestellt ist;
+Abbrechen oder Ablehnen lässt das Secret unverändert. `--yes` (oder `-y`)
+überspringt nur die Bestätigung, nicht die Auswahl bei fehlendem Namen oder
+eine erforderliche Entsperrabfrage.
+
+Interaktive Abfragen erfordern Terminals für stdin, stdout und stderr, einen
+`TERM`-Wert ungleich »dumb« und eine inaktive `CI`-Umgebung. Ohne interaktives
+Terminal ist ein Name erforderlich; das benannte Secret wird auch ohne `--yes`
+ohne Bestätigungsfrage entfernt.
+
+Entfernte Secrets erscheinen nicht mehr in normalen Abfragen oder Listen;
+der Versionsverlauf bleibt jedoch erhalten. Das ist keine sichere Löschung und
+widerruft keine Zugangsdaten beim externen Anbieter. Zur Wiederherstellung
+dienen `sotto history` und `sotto rollback`.
+
 ### Ein Secret teilen
 
 `sotto share` verschlüsselt ein Secret in einen Einmal-Link. Der Schlüssel steht im Link hinter dem
