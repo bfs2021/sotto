@@ -240,9 +240,12 @@ jobs:
       - name: Server + end-to-end tests (with Postgres)
         run: cargo test -p sotto-server -p sotto-cli
       - name: Server authorisation and transaction assurance
+        # Select the same packages as the step above. The CLI enables reqwest's blocking feature,
+        # so naming the server alone resolves different features and recompiles the server just
+        # to run this one target.
         run: |
           set -euo pipefail
-          cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
+          cargo test -p sotto-server -p sotto-cli --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
           grep -Eq '^SERVER_ASSURANCE_DONE 7$' server-assurance.log
       - name: Restore checker meets a real database
         # Its assertions are unit tested, but its queries are not: left alone they would only
