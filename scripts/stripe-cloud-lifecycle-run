@@ -457,6 +457,19 @@ def resume_run(path: Path, manifest: dict, client: StripeClient) -> dict:
         }
         private_atomic_json(path / "run.json", manifest)
 
+    # A saved ID proves what was created, not that it is still present. Check the
+    # clock before using it to create or resume its customer, and again on every
+    # resume of an existing prepared run.
+    clock = client.request("GET", f"/v1/test_helpers/test_clocks/{manifest['clock']['id']}")
+    if (
+        clock.get("id") != manifest["clock"]["id"]
+        or clock.get("object") != "test_helpers.test_clock"
+        or clock.get("name") != clock_name
+        or clock.get("status") != "ready"
+        or clock.get("frozen_time") != manifest["frozen_time"]
+    ):
+        raise RunError("test_clock_response_mismatch")
+
     if manifest["customer"]["id"] is None:
         manifest["customer"]["create_attempted"] = True
         private_atomic_json(path / "run.json", manifest)
@@ -489,6 +502,17 @@ def resume_run(path: Path, manifest: dict, client: StripeClient) -> dict:
             "create_attempted": False,
         }
         private_atomic_json(path / "run.json", manifest)
+
+    customer = client.request("GET", f"/v1/customers/{manifest['customer']['id']}")
+    if (
+        customer.get("id") != manifest["customer"]["id"]
+        or customer.get("object") != "customer"
+        or customer.get("deleted") is True
+        or customer.get("test_clock") != manifest["clock"]["id"]
+        or not isinstance(customer.get("metadata"), dict)
+        or customer["metadata"].get("sotto_lifecycle_run_id") != run_id
+    ):
+        raise RunError("customer_response_mismatch")
     manifest["status"] = "prepared"
     private_atomic_json(path / "run.json", manifest)
     return manifest

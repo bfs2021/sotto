@@ -35,16 +35,25 @@ class FakeStripeClient:
         self.fail_customer_delete_after_apply = False
         self.fail_clock_delete_after_apply = False
         self.clock_frozen_time_offset = 0
+        self.read_clock_frozen_time_offset = 0
+        self.created_clock_frozen_time = None
+        self.created_clock_name = None
+        self.created_customer_run_id = None
 
     def request(self, method, path, fields=None, *, idempotency_key=None):
         self.calls.append((method, path, fields, idempotency_key))
+        if method == "GET" and path == "/v1/account":
+            return {"id": "acct_123"}
         if method == "POST" and path == "/v1/test_helpers/test_clocks":
+            self.created_clock_frozen_time = fields["frozen_time"]
+            self.created_clock_name = fields["name"]
             return {
                 "id": "clock_test123", "object": "test_helpers.test_clock", "livemode": False,
                 "status": "ready", "name": fields["name"],
                 "frozen_time": fields["frozen_time"] + self.clock_frozen_time_offset,
             }
         if method == "POST" and path == "/v1/customers":
+            self.created_customer_run_id = fields["metadata[sotto_lifecycle_run_id]"]
             if self.customer_create_error is not None:
                 error = self.customer_create_error
                 self.customer_create_error = None
@@ -61,8 +70,9 @@ class FakeStripeClient:
             if self.customer_deleted:
                 return {"id": "cus_test123", "object": "customer", "deleted": True}
             return {
-                "id": "cus_test123", "livemode": False, "test_clock": "clock_test123",
-                "metadata": {"sotto_lifecycle_run_id": "11111111-1111-4111-8111-111111111111"}
+                "id": "cus_test123", "object": "customer", "livemode": False,
+                "test_clock": "clock_test123",
+                "metadata": {"sotto_lifecycle_run_id": self.created_customer_run_id or "11111111-1111-4111-8111-111111111111"}
                 if self.customer_owner else {},
             }
         if method == "GET" and path == "/v1/test_helpers/test_clocks":
@@ -107,8 +117,9 @@ class FakeStripeClient:
                 raise MODULE.RunError("stripe_resource_not_found")
             return {
                 "id": "clock_test123", "object": "test_helpers.test_clock", "livemode": False,
-                "status": "ready", "name": "sotto-lifecycle-11111111-1111-4111-8111-111111111111",
-                "frozen_time": int(time.time()) - 300,
+                "status": "ready", "name": self.created_clock_name or "sotto-lifecycle-11111111-1111-4111-8111-111111111111",
+                "frozen_time": (self.created_clock_frozen_time or int(time.time()) - 300)
+                + self.read_clock_frozen_time_offset,
             }
         if method == "DELETE" and path == "/v1/customers/cus_test123":
             self.customer_deleted = True
@@ -168,9 +179,13 @@ class StripeLifecycleRun(unittest.TestCase):
         self.assertEqual(prepared["customer"]["id"], "cus_test123")
         self.assertEqual(preflight.call_count, 1)
         self.assertEqual([call[1] for call in self.client.calls], [
-            "/v1/test_helpers/test_clocks", "/v1/customers",
+            "/v1/test_helpers/test_clocks", "/v1/test_helpers/test_clocks/clock_test123",
+            "/v1/customers", "/v1/customers/cus_test123",
         ])
-        self.assertTrue(all(call[3].startswith("sotto-lifecycle:") for call in self.client.calls))
+        self.assertTrue(all(
+            call[3].startswith("sotto-lifecycle:")
+            for call in self.client.calls if call[0] == "POST"
+        ))
         file = self.run_dir / "run.json"
         self.assertEqual(file.stat().st_mode & 0o777, 0o600)
         self.assertIn("cus_test123", file.read_text())
@@ -181,11 +196,12 @@ class StripeLifecycleRun(unittest.TestCase):
         self.client.fail_customer_once = True
         with self.assertRaisesRegex(MODULE.RunError, "stripe_request_unavailable"):
             MODULE.resume_run(self.run_dir, value, self.client)
-        customer_key = self.client.calls[1][3]
+        customer_key = next(call[3] for call in self.client.calls if call[1] == "/v1/customers")
 
         resumed = MODULE.resume_run(self.run_dir, MODULE.read_manifest(self.run_dir), self.client)
         self.assertEqual(resumed["status"], "prepared")
-        self.assertEqual(self.client.calls[2][3], customer_key)
+        customer_posts = [call for call in self.client.calls if call[1] == "/v1/customers"]
+        self.assertEqual(customer_posts[1][3], customer_key)
 
     def test_definite_customer_create_rejection_clears_uncertain_create_marker(self):
         value = manifest()
@@ -672,6 +688,53 @@ class StripeLifecycleRun(unittest.TestCase):
         saved = MODULE.read_manifest(self.run_dir)
         self.assertTrue(value["clock"]["create_attempted"])
         self.assertTrue(saved["clock"]["create_attempted"])
+
+    def test_resume_does_not_report_prepared_when_saved_resources_no_longer_match(self):
+        value = manifest()
+        value["status"] = "prepared"
+        value["clock"].update(id="clock_test123", created=True)
+        value["customer"].update(id="cus_test123", created=True)
+        MODULE.private_atomic_json(self.run_dir / "run.json", value)
+        self.client.customer_deleted = True
+
+        with self.assertRaisesRegex(MODULE.RunError, "customer_response_mismatch"):
+            MODULE.resume_run(self.run_dir, MODULE.read_manifest(self.run_dir), self.client)
+
+        self.assertEqual(self.client.calls, [
+            ("GET", "/v1/test_helpers/test_clocks/clock_test123", None, None),
+            ("GET", "/v1/customers/cus_test123", None, None),
+        ])
+        self.assertEqual(MODULE.read_manifest(self.run_dir)["status"], "prepared")
+
+    def test_resume_checks_existing_clock_before_creating_missing_customer(self):
+        value = manifest()
+        value["clock"].update(id="clock_test123", created=True)
+        self.client.read_clock_frozen_time_offset = 1
+
+        with self.assertRaisesRegex(MODULE.RunError, "test_clock_response_mismatch"):
+            MODULE.resume_run(self.run_dir, value, self.client)
+
+        self.assertFalse(any(call[1] == "/v1/customers" for call in self.client.calls))
+
+    def test_cli_prepare_resume_and_cleanup_complete_against_fake_provider(self):
+        fake = self.client
+        with (
+            mock.patch.object(MODULE, "key_and_config", return_value=(
+                "rk_test_fake", {}, "acct_123", "a" * 40,
+            )),
+            mock.patch.object(MODULE, "key_and_identity", return_value=("rk_test_fake", "acct_123")),
+            mock.patch.object(MODULE, "StripeClient", return_value=fake),
+            mock.patch.object(MODULE.PREFLIGHT, "run_preflight"),
+        ):
+            prepared = MODULE.main([
+                "prepare", "--run-dir", str(self.run_dir),
+                "--frozen-time", str(int(time.time()) - 300),
+            ])
+            resumed = MODULE.main(["resume", "--run-dir", str(self.run_dir)])
+            cleaned = MODULE.main(["cleanup", "--run-dir", str(self.run_dir)])
+
+        self.assertEqual((prepared, resumed, cleaned), (0, 0, 0))
+        self.assertEqual(MODULE.read_manifest(self.run_dir)["status"], "cleaned")
 
     def test_manifest_rejects_public_permissions_and_wrong_account(self):
         value = manifest()
