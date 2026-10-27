@@ -233,12 +233,17 @@ pub(crate) fn decode_authenticated_repair_event(
     }
     let paid_out_of_band = required_bool(invoice, "paid_out_of_band")?;
     let starting_balance = required_i64(invoice, "starting_balance")?;
+    let amount_paid_off_stripe = optional_i64(invoice, "amount_paid_off_stripe")?;
+    if amount_paid_off_stripe < 0 {
+        return Err(StripeRepairError::InvalidField("amount_paid_off_stripe"));
+    }
     if required_i64(invoice, "amount_due")? == 0
         || required_i64(invoice, "amount_remaining")? != required_i64(invoice, "amount_due")?
         || required_i64(invoice, "amount_paid")? != 0
         || required_i64(invoice, "amount_overpaid")? != 0
         || paid_out_of_band
         || starting_balance != 0
+        || amount_paid_off_stripe != 0
     {
         return Err(StripeRepairError::Unsupported("invoice settlement"));
     }
@@ -391,6 +396,12 @@ fn required_i64(value: &Value, field: &'static str) -> Result<i64, StripeRepairE
         .and_then(Value::as_i64)
         .ok_or(StripeRepairError::Malformed(field))
 }
+fn optional_i64(value: &Value, field: &'static str) -> Result<i64, StripeRepairError> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(_) => required_i64(value, field),
+    }
+}
 fn required_bool(value: &Value, field: &'static str) -> Result<bool, StripeRepairError> {
     value
         .get(field)
@@ -468,6 +479,22 @@ mod tests {
         assert_eq!(candidate.provenance().event_id(), "evt_repaired");
         assert_eq!(candidate.provenance().account_id(), "acct_test");
         assert!(!candidate.provenance().payload_hash().is_empty());
+    }
+
+    #[test]
+    fn nonzero_legacy_off_stripe_amount_is_not_repair_evidence() {
+        let mut event = event();
+        event["data"]["object"]["amount_paid_off_stripe"] = Value::from(1);
+        assert!(matches!(
+            decode_authenticated_repair_event(&event, 300, &config(), &binding()),
+            Err(StripeRepairError::Unsupported("invoice settlement"))
+        ));
+
+        event["data"]["object"]
+            .as_object_mut()
+            .unwrap()
+            .remove("amount_paid_off_stripe");
+        assert!(decode_authenticated_repair_event(&event, 300, &config(), &binding()).is_ok());
     }
 
     #[test]

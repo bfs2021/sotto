@@ -716,6 +716,44 @@ async fn links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separa
 }
 
 #[tokio::test]
+async fn signed_failure_rejects_nonzero_legacy_off_stripe_amount_when_present() {
+    let history = history().await;
+    let mut failure = signed_failure();
+    failure["data"]["object"]["amount_paid_off_stripe"] = json!(1);
+    let (raw, signature) = signed(&failure, NOW);
+    assert!(matches!(
+        decode_personal_renewal_failure(
+            &raw,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &history,
+        ),
+        Err(StripeContractError::UnsupportedSettlement(_))
+    ));
+
+    failure["data"]["object"]
+        .as_object_mut()
+        .unwrap()
+        .remove("amount_paid_off_stripe");
+    let (raw, signature) = signed(&failure, NOW);
+    assert!(matches!(
+        decode_personal_renewal_failure(
+            &raw,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &history,
+        ),
+        Ok(StripeRenewalFailureResult::Linked(_))
+    ));
+}
+
+#[tokio::test]
 async fn annual_history_and_signed_failure_keep_annual_price_provenance() {
     let history = history_with_line(paid_line_with("price_year", 1000, 2000)).await;
     let mut failure = signed_failure();

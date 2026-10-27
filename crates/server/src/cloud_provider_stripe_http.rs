@@ -2253,9 +2253,8 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
         && left.amount_due == right.amount_due
         && left.amount_remaining == right.amount_remaining
         && left.amount_overpaid == right.amount_overpaid
-        // Stripe omits this includable value from invoice list summaries unless expanded. The
-        // detail read requests it and the access decision validates that value, so a missing
-        // summary value is unknown rather than evidence that the invoice changed.
+        // Older provider payloads may include this non-standard defensive field. A list summary
+        // that omits it is unknown rather than evidence that the invoice changed.
         && (left.amount_paid_off_stripe.is_none()
             || left.amount_paid_off_stripe == right.amount_paid_off_stripe)
         && left.paid_out_of_band == right.paid_out_of_band

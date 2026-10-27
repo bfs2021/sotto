@@ -671,16 +671,21 @@ fn decode_paid_invoice_event(
             && observation.provider_item_id == binding.provider_item_id
             && observation.allocation_reference == binding.allocation_reference
     });
-    let paid_out_of_band = invoice
-        .get("paid_out_of_band")
-        .and_then(Value::as_bool)
-        .or_else(|| verified_observation_matches.map(|_| false))
-        .ok_or(StripeContractError::MissingField("paid_out_of_band"))?;
-    let starting_balance = invoice
-        .get("starting_balance")
-        .and_then(Value::as_i64)
-        .or_else(|| verified_observation_matches.map(|_| 0))
-        .ok_or(StripeContractError::MissingField("starting_balance"))?;
+    let paid_out_of_band = match invoice.get("paid_out_of_band") {
+        None | Some(Value::Null) => verified_observation_matches
+            .map(|_| false)
+            .ok_or(StripeContractError::MissingField("paid_out_of_band"))?,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(StripeContractError::InvalidField("paid_out_of_band")),
+    };
+    let starting_balance = match invoice.get("starting_balance") {
+        None | Some(Value::Null) => verified_observation_matches
+            .map(|_| 0)
+            .ok_or(StripeContractError::MissingField("starting_balance"))?,
+        Some(value) => value
+            .as_i64()
+            .ok_or(StripeContractError::InvalidField("starting_balance"))?,
+    };
     // `amount_paid_off_stripe` is not a field in Stripe's Invoice object. Preserve defensive
     // validation if a provider payload or fixture includes it, but do not require it for a
     // normal invoice event. The standard fields above identify out-of-band and balance-funded
@@ -1153,6 +1158,33 @@ mod tests {
                     &settlement,
                 ),
                 Err(StripeContractError::UnsupportedSettlement(_))
+            ));
+            event["data"]["object"][field] = if field == "paid_out_of_band" {
+                json!(false)
+            } else {
+                json!(0)
+            };
+        }
+
+        for (field, value) in [
+            ("paid_out_of_band", json!("false")),
+            ("starting_balance", json!("0")),
+        ] {
+            event["data"]["object"][field] = value;
+            let payload = serde_json::to_vec(&event).unwrap();
+            let signature = sign(&payload);
+            assert!(matches!(
+                decode_paid_invoice_with_observation(
+                    &payload,
+                    &signature,
+                    SECRET,
+                    NOW,
+                    &config,
+                    &binding,
+                    &settlement,
+                    &observation,
+                ),
+                Err(StripeContractError::InvalidField(_))
             ));
             event["data"]["object"][field] = if field == "paid_out_of_band" {
                 json!(false)
