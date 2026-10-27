@@ -311,6 +311,28 @@ class StripeLifecycleRun(unittest.TestCase):
         self.assertTrue(saved["clock"]["create_attempted"])
         self.assertFalse(any(call[0] == "DELETE" for call in self.client.calls))
 
+    def test_uncertain_customer_create_can_resume_after_cleanup_finds_no_customer(self):
+        value = manifest()
+        MODULE.private_atomic_json(self.run_dir / "run.json", value)
+        self.client.customer_create_error = "stripe_request_unavailable"
+
+        with self.assertRaisesRegex(MODULE.RunError, "stripe_request_unavailable"):
+            MODULE.resume_run(self.run_dir, value, self.client)
+        with self.assertRaisesRegex(MODULE.RunError, "run_resource_create_unresolved"):
+            MODULE.cleanup_run(self.run_dir, MODULE.read_manifest(self.run_dir), self.client)
+
+        incomplete = MODULE.read_manifest(self.run_dir)
+        self.assertEqual(incomplete["status"], "cleanup_incomplete")
+        self.assertTrue(incomplete["customer"]["create_attempted"])
+        self.assertIsNone(incomplete["customer"]["id"])
+        resumed = MODULE.resume_run(self.run_dir, incomplete, self.client)
+        self.assertEqual(resumed["status"], "prepared")
+        cleaned = MODULE.cleanup_run(self.run_dir, resumed, self.client)
+
+        self.assertEqual(cleaned["status"], "cleaned")
+        self.assertTrue(cleaned["customer"]["deleted"])
+        self.assertTrue(cleaned["clock"]["deleted"])
+
     def test_cleanup_resumes_after_customer_delete_response_is_lost(self):
         value = manifest()
         value["clock"] = {
@@ -351,6 +373,8 @@ class StripeLifecycleRun(unittest.TestCase):
         interrupted = MODULE.read_manifest(self.run_dir)
         self.assertEqual(interrupted["status"], "cleanup_incomplete")
         self.assertTrue(interrupted["customer"]["deleted"])
+        with self.assertRaisesRegex(MODULE.RunError, "run_is_not_resumable"):
+            MODULE.resume_run(self.run_dir, interrupted, self.client)
         cleaned = MODULE.cleanup_run(self.run_dir, interrupted, self.client)
 
         self.assertEqual(cleaned["status"], "cleaned")
@@ -611,6 +635,22 @@ class StripeLifecycleRun(unittest.TestCase):
         value["started_at_epoch"] = int(time.time()) - MODULE.RESUME_HORIZON_SECONDS - 1
         with self.assertRaisesRegex(MODULE.RunError, "resume_idempotency_horizon_exceeded"):
             MODULE.resume_run(self.run_dir, value, self.client)
+        self.assertEqual(self.client.calls, [])
+
+    def test_cleanup_incomplete_uncertain_create_cannot_replay_past_key_horizon(self):
+        value = manifest()
+        value["status"] = "cleanup_incomplete"
+        value["started_at_epoch"] = int(time.time()) - MODULE.RESUME_HORIZON_SECONDS - 1
+        value["started_at"] = MODULE.datetime.fromtimestamp(
+            value["started_at_epoch"], MODULE.timezone.utc,
+        ).isoformat().replace("+00:00", "Z")
+        value["frozen_time"] = value["started_at_epoch"] - 300
+        value["clock"].update(id="clock_test123", created=True)
+        value["customer"]["create_attempted"] = True
+
+        with self.assertRaisesRegex(MODULE.RunError, "resume_idempotency_horizon_exceeded"):
+            MODULE.resume_run(self.run_dir, value, self.client)
+
         self.assertEqual(self.client.calls, [])
 
     def test_prepare_requires_clock_time_old_enough_for_preflight_reads(self):

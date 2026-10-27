@@ -405,7 +405,18 @@ def make_run(path: Path, frozen_time: int, client: StripeClient, prices: dict[st
 
 
 def resume_run(path: Path, manifest: dict, client: StripeClient) -> dict:
-    if manifest["status"] not in {"preparing", "prepared"}:
+    uncertain_create_cleanup = (
+        manifest["status"] == "cleanup_incomplete"
+        and any(
+            resource["id"] is None and resource["create_attempted"] and not resource["deleted"]
+            for resource in (manifest["clock"], manifest["customer"])
+        )
+        and all(not resource["deleted"] for resource in (manifest["clock"], manifest["customer"]))
+    )
+    if (
+        manifest["status"] not in {"preparing", "prepared"}
+        and not uncertain_create_cleanup
+    ):
         raise RunError("run_is_not_resumable")
     unresolved_create = any(
         resource["id"] is None and not resource["deleted"]
@@ -680,7 +691,10 @@ def main(argv: list[str] | None = None) -> int:
     prepare = subparsers.add_parser("prepare", help="create a test clock and empty customer")
     prepare.add_argument("--run-dir", required=True, help="new owner-only directory outside the repository")
     prepare.add_argument("--frozen-time", required=True, type=int, help="initial test-clock Unix timestamp")
-    resume = subparsers.add_parser("resume", help="resume a partial prepare within the idempotency horizon")
+    resume = subparsers.add_parser(
+        "resume",
+        help="resume an incomplete prepare or settle an uncertain create within the idempotency horizon",
+    )
     resume.add_argument("--run-dir", required=True)
     cleanup = subparsers.add_parser(
         "cleanup",
