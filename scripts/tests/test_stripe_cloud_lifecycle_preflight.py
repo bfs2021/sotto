@@ -25,14 +25,18 @@ def account(account_id="acct_123"):
     return {"id": account_id, "object": "account"}
 
 
-def price(price_id, amount, interval, livemode=False):
+def price(price_id, amount, interval, livemode=False, usage_type="licensed"):
     return {
         "id": price_id,
         "active": True,
         "livemode": livemode,
         "currency": "gbp",
         "unit_amount": amount,
-        "recurring": {"interval": interval, "interval_count": 1},
+        "recurring": {
+            "interval": interval,
+            "interval_count": 1,
+            "usage_type": usage_type,
+        },
     }
 
 
@@ -126,6 +130,18 @@ class SandboxPreflight(unittest.TestCase):
         ):
             MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
 
+    def test_metered_prices_are_rejected(self):
+        def response(path, key):
+            result = provider_response(path, key)
+            if path == "/v1/prices/price_standard_monthly":
+                result["recurring"]["usage_type"] = "metered"
+            return result
+
+        with self.assertRaisesRegex(
+            MODULE.PreflightError, "price_catalogue_mismatch:standard_monthly"
+        ):
+            MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
+
     def test_duplicate_price_ids_are_rejected_before_provider_reads(self):
         configured = prices()
         configured["founding_monthly"] = configured["standard_monthly"]
@@ -155,7 +171,7 @@ class SandboxPreflight(unittest.TestCase):
                 return False
 
             def read(self, _limit):
-                return b'{"id":"acct_123","livemode":false}'
+                return b'{"id":"acct_123","object":"account"}'
 
         with mock.patch.object(MODULE, "build_opener") as build_opener:
             build_opener.return_value.open.return_value = Response()

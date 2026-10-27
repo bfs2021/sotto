@@ -159,6 +159,7 @@ def run_preflight(
             or not isinstance(recurring, dict)
             or recurring.get("interval") != expected_interval
             or recurring.get("interval_count") != 1
+            or recurring.get("usage_type") != "licensed"
         ):
             raise PreflightError(f"price_catalogue_mismatch:{offer}")
         observations.append(
@@ -169,6 +170,7 @@ def run_preflight(
                 "currency": "gbp",
                 "interval": expected_interval,
                 "interval_count": 1,
+                "usage_type": "licensed",
             }
         )
 
