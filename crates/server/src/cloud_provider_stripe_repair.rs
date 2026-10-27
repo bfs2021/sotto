@@ -231,7 +231,6 @@ pub(crate) fn decode_authenticated_repair_event(
             return Err(StripeRepairError::InvalidField(field));
         }
     }
-    let paid_out_of_band = required_bool(invoice, "paid_out_of_band")?;
     let starting_balance = required_i64(invoice, "starting_balance")?;
     let amount_paid_off_stripe = optional_i64(invoice, "amount_paid_off_stripe")?;
     if amount_paid_off_stripe < 0 {
@@ -241,7 +240,6 @@ pub(crate) fn decode_authenticated_repair_event(
         || required_i64(invoice, "amount_remaining")? != required_i64(invoice, "amount_due")?
         || required_i64(invoice, "amount_paid")? != 0
         || required_i64(invoice, "amount_overpaid")? != 0
-        || paid_out_of_band
         || starting_balance != 0
         || amount_paid_off_stripe != 0
     {
@@ -454,7 +452,7 @@ mod tests {
                 "billing_reason": "subscription_cycle", "collection_method": "charge_automatically",
                 "status": "open", "currency": "gbp", "amount_due": 1000,
                 "amount_remaining": 1000, "amount_paid": 0, "amount_overpaid": 0,
-                "paid_out_of_band": false, "starting_balance": 0,
+                "starting_balance": 0,
                 "parent": { "type": "subscription_details",
                     "subscription_details": { "subscription": "sub_one" } },
                 "lines": { "object": "list", "has_more": false, "data": [{
@@ -482,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_legacy_off_stripe_amount_is_not_repair_evidence() {
+    fn nonzero_off_stripe_amount_is_not_repair_evidence() {
         let mut event = event();
         event["data"]["object"]["amount_paid_off_stripe"] = Value::from(1);
         assert!(matches!(

@@ -7704,6 +7704,19 @@ async fn repair_authenticated_personal_renewal_failure(
             ));
         }
     };
+    let failure_invoice_is_open = stripe
+        .personal_renewal_failure_invoice_is_open_and_unpaid(
+            &mut session,
+            candidate.invoice_id(),
+            &binding,
+        )
+        .await
+        .map_err(|_| Error::Internal("Stripe failed invoice detail read failed".into()))?;
+    if !failure_invoice_is_open {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "renewal_invoice_not_open_or_unpaid",
+        ));
+    }
     let linked = crate::cloud_provider_stripe_renewals::link_repaired_candidate(
         &candidate,
         coverage_config,
@@ -7958,6 +7971,9 @@ async fn prepare_signed_personal_renewal_failure(
     }
 
     let mut session = stripe.session();
+    let Some(invoice_id) = invoice.get("id").and_then(stripe_reference) else {
+        return Ok(None);
+    };
     let history = match stripe
         .personal_invoice_history(&mut session, &binding)
         .await
@@ -7970,6 +7986,13 @@ async fn prepare_signed_personal_renewal_failure(
             return Ok(None);
         }
     };
+    let failure_invoice_is_open = stripe
+        .personal_renewal_failure_invoice_is_open_and_unpaid(&mut session, &invoice_id, &binding)
+        .await
+        .map_err(|_| Error::Internal("Stripe failed invoice detail read failed".into()))?;
+    if !failure_invoice_is_open {
+        return Ok(None);
+    }
     let result = crate::cloud_provider_stripe_renewals::decode_personal_renewal_failure(
         raw_event.as_bytes(),
         signature,

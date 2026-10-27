@@ -217,7 +217,7 @@ fn paid_invoice() -> Value {
         "customer":"cus_renewal",
         "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
         "status":"paid","currency":"gbp","amount_paid":299,"amount_due":299,
-        "amount_overpaid":0,"amount_paid_off_stripe":0,"paid_out_of_band":false,"starting_balance":0,"livemode":false,
+        "amount_overpaid":0,"amount_paid_off_stripe":0,"starting_balance":0,"livemode":false,
         "metadata":{"sotto_allocation_reference":"alloc_renewal"}
     })
 }
@@ -244,7 +244,7 @@ fn generic_open_invoice() -> Value {
         "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
         "status":"open","billing_reason":"manual","collection_method":"send_invoice",
         "currency":"gbp","amount_paid":0,"amount_due":299,"amount_remaining":299,
-        "amount_overpaid":0,"amount_paid_off_stripe":0,"paid_out_of_band":false,"starting_balance":0,"livemode":false,
+        "amount_overpaid":0,"starting_balance":0,"livemode":false,
         "metadata":{"sotto_allocation_reference":"alloc_renewal"}
     })
 }
@@ -259,7 +259,7 @@ fn signed_failure() -> Value {
             "status":"open","billing_reason":"subscription_cycle",
             "collection_method":"charge_automatically","currency":"gbp",
             "amount_due":299,"amount_remaining":299,"amount_paid":0,
-            "amount_overpaid":0,"amount_paid_off_stripe":0,"paid_out_of_band":false,"starting_balance":0,"livemode":false,
+            "amount_overpaid":0,"starting_balance":0,"livemode":false,
             "metadata":{"sotto_allocation_reference":"alloc_renewal"},
             "lines":{"object":"list","has_more":false,"data":[{
                 "id":"il_failed","invoice":"in_failed","livemode":false,"quantity":1,
@@ -339,8 +339,8 @@ async fn sponsored_failure_read_ignores_a_late_event_for_a_closed_invoice() {
         server.requests.lock().unwrap().as_slice(),
         [
             "GET /v1/account",
-            "GET /v1/invoices/in_sponsored_closed",
-            "GET /v1/invoices/in_sponsored_missing_status"
+            "GET /v1/invoices/in_sponsored_closed?expand%5B%5D=amount_paid_off_stripe",
+            "GET /v1/invoices/in_sponsored_missing_status?expand%5B%5D=amount_paid_off_stripe"
         ]
     );
 }
@@ -716,7 +716,7 @@ async fn links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separa
 }
 
 #[tokio::test]
-async fn signed_failure_rejects_nonzero_legacy_off_stripe_amount_when_present() {
+async fn signed_failure_rejects_nonzero_off_stripe_amount_when_present() {
     let history = history().await;
     let mut failure = signed_failure();
     failure["data"]["object"]["amount_paid_off_stripe"] = json!(1);
@@ -1001,7 +1001,7 @@ fn current_invoice(status: &str) -> Value {
         "collection_method":"charge_automatically","currency":"gbp",
         "amount_paid": if status == "paid" { 299 } else { 0 },"amount_due":299,
         "amount_remaining": if status == "open" { 299 } else { 0 },
-        "amount_overpaid":0,"amount_paid_off_stripe":0,"paid_out_of_band":false,"starting_balance":0,"livemode":false,
+        "amount_overpaid":0,"amount_paid_off_stripe":0,"starting_balance":0,"livemode":false,
         "metadata":{"sotto_allocation_reference":"alloc_renewal"}
     })
 }
@@ -1578,13 +1578,13 @@ async fn current_paid_invoice_supersedes_historical_failure_and_preserves_cancel
         vec![
             "GET /v1/account",
             "GET /v1/subscriptions/sub_renewal",
-            "GET /v1/invoices/in_failed",
+            "GET /v1/invoices/in_failed?expand%5B%5D=amount_paid_off_stripe",
             "GET /v1/invoices/in_failed/lines?limit=100",
             "GET /v1/invoice_payments?invoice=in_failed&limit=100",
             "GET /v1/refunds?payment_intent=pi_current&limit=100",
             "GET /v1/disputes?payment_intent=pi_current&limit=100",
             "GET /v1/credit_notes?invoice=in_failed&limit=100",
-            "GET /v1/invoices/in_failed",
+            "GET /v1/invoices/in_failed?expand%5B%5D=amount_paid_off_stripe",
             "GET /v1/subscriptions/sub_renewal",
         ]
     );

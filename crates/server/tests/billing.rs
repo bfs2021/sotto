@@ -2125,7 +2125,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         }},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
         "amount_remaining":0, "amount_overpaid":0,
-        "paid_out_of_band":false, "starting_balance":0,
+        "amount_paid_off_stripe":0, "starting_balance":0,
         "livemode":false, "metadata":{"sotto_allocation_reference":allocation_reference},
         "lines":{"data":[{
             "id":"il_coverage_person", "quantity":1, "livemode":false,
@@ -2219,10 +2219,15 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         sotto_server::config::DeploymentMode::Cloud,
     );
 
+    let mut invoice_event_object = invoice.clone();
+    invoice_event_object
+        .as_object_mut()
+        .expect("invoice event object")
+        .remove("amount_paid_off_stripe");
     let invoice_event = serde_json::json!({
         "id":format!("evt_coverage_invoice_{fixture}"), "created":now + 5,
         "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
-        "data":{"object":invoice}
+        "data":{"object":invoice_event_object}
     })
     .to_string();
 
@@ -2758,15 +2763,16 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
         "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
         "amount_remaining":0, "amount_overpaid":0,
-        "paid_out_of_band":false, "starting_balance":0, "livemode":false,
+        "starting_balance":0, "livemode":false,
         "metadata":{"sotto_allocation_reference":allocation_reference}
     });
     let open_invoice = serde_json::json!({
         "id":invoice_id, "customer":customer_id,
         "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
+        "billing_reason":"subscription_cycle", "collection_method":"charge_automatically",
         "status":"open", "currency":"gbp", "amount_paid":0, "amount_due":299,
         "amount_remaining":299, "amount_overpaid":0,
-        "paid_out_of_band":false, "starting_balance":0, "livemode":false,
+        "starting_balance":0, "livemode":false,
         "metadata":{"sotto_allocation_reference":allocation_reference}
     });
     let paid_line = serde_json::json!({
@@ -2793,7 +2799,7 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
             "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
             "status":"open", "billing_reason":"subscription_cycle", "collection_method":"charge_automatically",
             "currency":"gbp", "amount_due":299, "amount_remaining":299, "amount_paid":0,
-            "amount_overpaid":0, "paid_out_of_band":false, "starting_balance":0, "livemode":false,
+            "amount_overpaid":0, "starting_balance":0, "livemode":false,
             "metadata":{"sotto_allocation_reference":allocation_reference},
             "lines":{"object":"list", "has_more":false, "data":[failed_line]}
         }}
@@ -2802,13 +2808,17 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     let paid_id = paid_invoice["id"].as_str().unwrap().to_owned();
     let listed_paid = paid_invoice.clone();
     let mut paid_detail = paid_invoice.clone();
+    paid_detail["amount_paid_off_stripe"] = serde_json::json!(0);
     paid_detail["lines"] =
         serde_json::json!({"object":"list", "data":[paid_line], "has_more":false});
+    let mut open_detail = open_invoice.clone();
+    open_detail["amount_paid_off_stripe"] = serde_json::json!(0);
     let (origin, stripe_task) = stripe_mock_server(HashMap::from([
         ("/v1/account".into(), serde_json::json!({"id":account_id, "object":"account"})),
         (format!("/v1/subscriptions/{subscription_id}"), serde_json::json!({"id":subscription_id, "customer":customer_id, "status":"active", "livemode":false})),
         ("/v1/invoices".into(), serde_json::json!({"object":"list", "data":[listed_paid, open_invoice], "has_more":false})),
         (format!("/v1/invoices/{paid_id}"), paid_detail),
+        (format!("/v1/invoices/{invoice_id}"), open_detail),
         (format!("/v1/invoices/{paid_id}/lines"), serde_json::json!({"object":"list", "data":[paid_line], "has_more":false})),
         ("/v1/invoice_payments".into(), serde_json::json!({"object":"list", "data":[{
             "id":format!("inpay_{fixture}"), "invoice":paid_id, "status":"paid", "amount_paid":299,

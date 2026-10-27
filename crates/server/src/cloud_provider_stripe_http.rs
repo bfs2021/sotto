@@ -19,7 +19,7 @@ use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
     StripeContractError, StripeCoverageConfig, StripePersonalInvoiceFacts,
-    StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY,
+    StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY, STRIPE_CURRENCY,
 };
 use crate::cloud_provider_stripe_corrections::{
     evaluate_personal_invoice_access, StripePersonalInvoiceAccessDecision,
@@ -414,7 +414,14 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}");
-        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        let value = self
+            .request_json(
+                session,
+                Method::GET,
+                &path,
+                &[("expand[]".into(), "amount_paid_off_stripe".into())],
+            )
+            .await?;
         let resource = parse_invoice(&value)?;
         if resource.id != invoice_id {
             return Err(StripeReadError::ContextMismatch);
@@ -799,11 +806,11 @@ impl StripeReadClient {
             .ok_or(StripeReadError::MalformedResponse(
                 "invoice.amount_overpaid",
             ))?;
-        let paid_out_of_band =
+        let amount_paid_off_stripe =
             invoice
-                .paid_out_of_band
+                .amount_paid_off_stripe
                 .ok_or(StripeReadError::MalformedResponse(
-                    "invoice.paid_out_of_band",
+                    "invoice.amount_paid_off_stripe",
                 ))?;
         let starting_balance =
             invoice
@@ -817,10 +824,7 @@ impl StripeReadClient {
             .ok_or(StripeReadError::MalformedResponse("invoice.currency"))?;
         if amount_remaining != 0
             || amount_overpaid != 0
-            || invoice
-                .amount_paid_off_stripe
-                .is_some_and(|amount| amount != 0)
-            || paid_out_of_band
+            || amount_paid_off_stripe != 0
             || starting_balance != 0
         {
             return Err(StripeReadError::Observation(
@@ -1070,11 +1074,11 @@ impl StripeReadClient {
             ));
         }
         let settlement = payments[0].settlement(&self.coverage)?;
-        let paid_out_of_band =
+        let amount_paid_off_stripe =
             invoice
-                .paid_out_of_band
+                .amount_paid_off_stripe
                 .ok_or(StripeReadError::MalformedResponse(
-                    "invoice.paid_out_of_band",
+                    "invoice.amount_paid_off_stripe",
                 ))?;
         let starting_balance =
             invoice
@@ -1123,8 +1127,7 @@ impl StripeReadClient {
                 amount_overpaid: invoice.amount_overpaid.ok_or(
                     StripeReadError::MalformedResponse("invoice.amount_overpaid"),
                 )?,
-                amount_paid_off_stripe: invoice.amount_paid_off_stripe.unwrap_or(0),
-                paid_out_of_band,
+                amount_paid_off_stripe,
                 starting_balance,
                 period_start: line
                     .period_start
@@ -1605,6 +1608,48 @@ impl StripeReadClient {
         Ok(Some((invoice, lines)))
     }
 
+    /// Verify that a personal renewal-failure snapshot still describes an unpaid Stripe invoice.
+    /// The webhook does not carry expanded `amount_paid_off_stripe`, so failure evidence is only
+    /// usable after this detail read confirms no off-Stripe payment or customer-balance amount.
+    #[doc(hidden)]
+    pub async fn personal_renewal_failure_invoice_is_open_and_unpaid(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+        binding: &StripeAllocationBinding,
+    ) -> Result<bool, StripeReadError> {
+        let invoice = self.invoice(session, invoice_id).await?;
+        validate_current_invoice(&invoice, binding)?;
+        match invoice.status.as_deref() {
+            Some("open") => {}
+            Some("paid" | "void" | "uncollectible") => return Ok(false),
+            Some(_) => {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::UnsupportedSettlement(
+                        "personal renewal invoice is not open or closed",
+                    ),
+                ));
+            }
+            None => return Err(StripeReadError::MalformedResponse("invoice.status")),
+        }
+        if invoice.billing_reason.as_deref() != Some("subscription_cycle")
+            || invoice.collection_method.as_deref() != Some("charge_automatically")
+            || invoice
+                .currency
+                .as_deref()
+                .is_none_or(|currency| !currency.eq_ignore_ascii_case(STRIPE_CURRENCY))
+            || invoice.amount_due.is_none_or(|amount| amount <= 0)
+            || invoice.amount_remaining != invoice.amount_due
+            || invoice.amount_paid != Some(0)
+            || invoice.amount_overpaid != Some(0)
+            || invoice.amount_paid_off_stripe != Some(0)
+            || invoice.starting_balance != Some(0)
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     async fn list_bounded<T, F>(
         &self,
         session: &mut StripeReadSession,
@@ -1996,7 +2041,6 @@ pub struct StripeInvoiceResource {
     pub amount_remaining: Option<i64>,
     pub amount_overpaid: Option<i64>,
     pub amount_paid_off_stripe: Option<i64>,
-    pub paid_out_of_band: Option<bool>,
     pub starting_balance: Option<i64>,
     pub allocation_reference: Option<String>,
     pub livemode: Option<bool>,
@@ -2253,11 +2297,10 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
         && left.amount_due == right.amount_due
         && left.amount_remaining == right.amount_remaining
         && left.amount_overpaid == right.amount_overpaid
-        // Older provider payloads may include this non-standard defensive field. A list summary
-        // that omits it is unknown rather than evidence that the invoice changed.
+        // Stripe only returns this includable value when expanded on an invoice detail read. A
+        // list summary that omits it is unknown rather than evidence that the invoice changed.
         && (left.amount_paid_off_stripe.is_none()
             || left.amount_paid_off_stripe == right.amount_paid_off_stripe)
-        && left.paid_out_of_band == right.paid_out_of_band
         && left.starting_balance == right.starting_balance
         && left.allocation_reference == right.allocation_reference
         && left.livemode == right.livemode
@@ -2412,8 +2455,7 @@ fn open_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
         (Some(due), Some(remaining), Some(0), Some(0), amount_paid_off_stripe)
             if due > 0
                 && remaining == due
-                && amount_paid_off_stripe.is_none_or(|amount| amount == 0)
-                && invoice.paid_out_of_band == Some(false)
+                && amount_paid_off_stripe == Some(0)
                 && invoice.starting_balance == Some(0)
     )
 }
@@ -2431,8 +2473,7 @@ fn closed_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
             if due >= 0
                 && remaining >= 0
                 && remaining <= due
-                && amount_paid_off_stripe.is_none_or(|amount| amount == 0)
-                && invoice.paid_out_of_band == Some(false)
+                && amount_paid_off_stripe == Some(0)
                 && invoice.starting_balance == Some(0)
     )
 }
@@ -2990,7 +3031,6 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             value.get("amount_paid_off_stripe"),
             "invoice.amount_paid_off_stripe",
         )?,
-        paid_out_of_band: optional_bool(value.get("paid_out_of_band"), "invoice.paid_out_of_band")?,
         starting_balance: optional_i64(value.get("starting_balance"), "invoice.starting_balance")?,
         allocation_reference: parent_allocation_reference.or(invoice_allocation_reference),
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,

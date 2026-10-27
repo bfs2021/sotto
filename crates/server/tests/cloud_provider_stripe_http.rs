@@ -11,7 +11,9 @@ use axum::routing::any;
 use axum::Router;
 use serde_json::{json, Value};
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
-use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
+use sotto_server::cloud_provider_stripe::{
+    StripeAllocationBinding, StripeContractError, StripeCoverageConfig,
+};
 use sotto_server::cloud_provider_stripe_corrections::{
     evaluate_personal_invoice_access, StripeCorrectionUnresolved,
     StripePersonalInvoiceAccessDecision, StripePersonalInvoiceCorrectionEvidence,
@@ -321,7 +323,32 @@ fn paid_invoice() -> Value {
         "amount_due":299,
         "amount_remaining":0,
         "amount_overpaid":0,
-        "paid_out_of_band":false,
+        "amount_paid_off_stripe":0,
+        "starting_balance":0,
+        "livemode":false,
+    })
+}
+
+fn open_renewal_invoice() -> Value {
+    json!({
+        "id":"in_1",
+        "customer":"cus_1",
+        "parent":{
+            "type":"subscription_details",
+            "subscription_details":{
+                "subscription":"sub_1",
+                "metadata":{"sotto_allocation_reference":"alloc_1"}
+            }
+        },
+        "status":"open",
+        "billing_reason":"subscription_cycle",
+        "collection_method":"charge_automatically",
+        "currency":"gbp",
+        "amount_paid":0,
+        "amount_due":299,
+        "amount_remaining":299,
+        "amount_overpaid":0,
+        "amount_paid_off_stripe":0,
         "starting_balance":0,
         "livemode":false,
     })
@@ -580,14 +607,8 @@ async fn assembles_a_personal_invoice_observation_from_complete_reads() {
 }
 
 #[tokio::test]
-async fn accepts_paid_personal_invoice_without_nonexistent_off_stripe_amount_field() {
-    let mut invoice = paid_invoice();
-    invoice["paid_out_of_band"] = json!(false);
-    invoice
-        .as_object_mut()
-        .expect("invoice fixture is an object")
-        .remove("amount_paid_off_stripe");
-
+async fn paid_personal_invoice_requests_expanded_off_stripe_amount() {
+    let invoice = paid_invoice();
     let mut responses = HashMap::new();
     responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
     responses.insert(
@@ -610,10 +631,62 @@ async fn accepts_paid_personal_invoice_without_nonexistent_off_stripe_amount_fie
     let observation = client
         .personal_invoice_observation(&mut session, "in_1", &personal_binding())
         .await
-        .expect("a complete PaymentIntent settlement is sufficient evidence");
+        .expect("the detail read includes the expanded off-Stripe amount");
 
     assert_eq!(observation.invoice_id(), "in_1");
     assert_eq!(observation.payment_intent_id(), "pi_1");
+    let calls = server.state.calls.lock().unwrap();
+    let detail = calls
+        .iter()
+        .find(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
+        .expect("invoice detail was read");
+    assert!(query_pairs(detail)
+        .iter()
+        .any(|(key, value)| key == "expand[]" && value == "amount_paid_off_stripe"));
+}
+
+#[tokio::test]
+async fn renewal_failure_requires_expanded_open_invoice_evidence() {
+    for (mut invoice, expected) in [
+        (open_renewal_invoice(), true),
+        ({
+            let mut invoice = open_renewal_invoice();
+            invoice["amount_paid_off_stripe"] = json!(1);
+            (invoice, false)
+        }),
+    ] {
+        let mut responses = HashMap::new();
+        responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+        responses.insert(
+            "/v1/invoices/in_1".into(),
+            vec![MockResponse::json(invoice.take())],
+        );
+        let server = mock_server(responses).await;
+        let client =
+            StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits())
+                .unwrap();
+        let mut session = client.session();
+
+        assert_eq!(
+            client
+                .personal_renewal_failure_invoice_is_open_and_unpaid(
+                    &mut session,
+                    "in_1",
+                    &personal_binding(),
+                )
+                .await
+                .unwrap(),
+            expected
+        );
+        let calls = server.state.calls.lock().unwrap();
+        let detail = calls
+            .iter()
+            .find(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
+            .expect("invoice detail was read");
+        assert!(query_pairs(detail)
+            .iter()
+            .any(|(key, value)| key == "expand[]" && value == "amount_paid_off_stripe"));
+    }
 }
 
 #[tokio::test]
@@ -1207,7 +1280,7 @@ async fn reads_all_payment_pages_before_rejecting_ambiguous_settlement() {
             .personal_invoice_observation(&mut session, "in_1", &personal_binding())
             .await,
         Err(StripeReadError::Observation(
-            sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+            StripeContractError::UnsupportedSettlement(_)
         ))
     ));
     assert!(server
@@ -1242,7 +1315,7 @@ async fn rejects_amount_period_and_settlement_contract_violations() {
     ));
 
     for (field, value) in [
-        ("paid_out_of_band", json!(true)),
+        ("amount_paid_off_stripe", json!(1)),
         ("starting_balance", json!(1)),
     ] {
         let mut invoice = paid_invoice();
@@ -1747,10 +1820,12 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
         .any(|call| call.path_and_query.contains("starting_after=in_2")));
     let invoice_detail_calls: Vec<_> = calls
         .iter()
-        .filter(|call| call.path_and_query == "/v1/invoices/in_1")
+        .filter(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
         .collect();
     assert_eq!(invoice_detail_calls.len(), 1);
-    assert!(query_pairs(invoice_detail_calls[0]).is_empty());
+    assert!(query_pairs(invoice_detail_calls[0])
+        .iter()
+        .any(|(key, value)| key == "expand[]" && value == "amount_paid_off_stripe"));
 }
 
 #[tokio::test]
@@ -2065,7 +2140,7 @@ async fn invoice_history_detects_a_paid_header_change_during_assembly() {
     );
     let listed = paid_invoice();
     let mut detailed = paid_invoice();
-    detailed["paid_out_of_band"] = json!(true);
+    detailed["amount_paid_off_stripe"] = json!(1);
     responses.insert(
         "/v1/invoices".into(),
         vec![MockResponse::json(list(vec![listed], false))],
