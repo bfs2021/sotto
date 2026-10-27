@@ -484,6 +484,9 @@ def resume_run(path: Path, manifest: dict, client: StripeClient) -> dict:
 
 
 def cleanup_run(path: Path, manifest: dict, client: StripeClient) -> dict:
+    if manifest["status"] != "cleaned":
+        manifest["status"] = "cleanup_incomplete"
+        private_atomic_json(path / "run.json", manifest)
     run_id = manifest["run_id"]
     clock_name = f"sotto-lifecycle-{run_id}"
     if (

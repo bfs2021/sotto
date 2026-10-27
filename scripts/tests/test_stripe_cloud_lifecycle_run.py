@@ -334,6 +334,7 @@ class StripeLifecycleRun(unittest.TestCase):
 
     def test_cleanup_resumes_after_clock_delete_response_is_lost(self):
         value = manifest()
+        value["status"] = "prepared"
         value["clock"] = {
             "id": "clock_test123", "created": True, "deleted": False,
             "create_attempted": False,
@@ -347,7 +348,10 @@ class StripeLifecycleRun(unittest.TestCase):
 
         with self.assertRaisesRegex(MODULE.RunError, "stripe_request_unavailable"):
             MODULE.cleanup_run(self.run_dir, value, self.client)
-        cleaned = MODULE.cleanup_run(self.run_dir, MODULE.read_manifest(self.run_dir), self.client)
+        interrupted = MODULE.read_manifest(self.run_dir)
+        self.assertEqual(interrupted["status"], "cleanup_incomplete")
+        self.assertTrue(interrupted["customer"]["deleted"])
+        cleaned = MODULE.cleanup_run(self.run_dir, interrupted, self.client)
 
         self.assertEqual(cleaned["status"], "cleaned")
         self.assertTrue(cleaned["clock"]["deleted"])
