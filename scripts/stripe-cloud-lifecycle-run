@@ -466,7 +466,8 @@ def resume_run(path: Path, manifest: dict, client: StripeClient) -> dict:
         or clock.get("object") != "test_helpers.test_clock"
         or clock.get("name") != clock_name
         or clock.get("status") != "ready"
-        or clock.get("frozen_time") != manifest["frozen_time"]
+        or type(clock.get("frozen_time")) is not int
+        or clock["frozen_time"] < manifest["frozen_time"]
     ):
         raise RunError("test_clock_response_mismatch")
 

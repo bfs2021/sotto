@@ -709,12 +709,27 @@ class StripeLifecycleRun(unittest.TestCase):
     def test_resume_checks_existing_clock_before_creating_missing_customer(self):
         value = manifest()
         value["clock"].update(id="clock_test123", created=True)
-        self.client.read_clock_frozen_time_offset = 1
+        self.client.read_clock_frozen_time_offset = -1
 
         with self.assertRaisesRegex(MODULE.RunError, "test_clock_response_mismatch"):
             MODULE.resume_run(self.run_dir, value, self.client)
 
         self.assertFalse(any(call[1] == "/v1/customers" for call in self.client.calls))
+
+    def test_resume_accepts_an_owned_clock_advanced_by_a_lifecycle_run(self):
+        value = manifest()
+        value["status"] = "prepared"
+        value["clock"].update(id="clock_test123", created=True)
+        value["customer"].update(id="cus_test123", created=True)
+        self.client.created_clock_frozen_time = value["frozen_time"]
+        self.client.read_clock_frozen_time_offset = 86_400
+
+        resumed = MODULE.resume_run(self.run_dir, value, self.client)
+
+        self.assertEqual(resumed["status"], "prepared")
+        self.assertEqual([call[1] for call in self.client.calls], [
+            "/v1/test_helpers/test_clocks/clock_test123", "/v1/customers/cus_test123",
+        ])
 
     def test_cli_prepare_resume_and_cleanup_complete_against_fake_provider(self):
         fake = self.client
