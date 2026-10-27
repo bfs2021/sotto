@@ -1143,7 +1143,7 @@ mod tests {
         let payload = serde_json::to_vec(&event).unwrap();
         let signature = sign(&payload);
         assert!(matches!(
-            decode_paid_invoice(
+            decode_paid_invoice_with_observation(
                 &payload,
                 &signature,
                 SECRET,
@@ -1151,6 +1151,7 @@ mod tests {
                 &config,
                 &binding,
                 &settlement,
+                &observation,
             ),
             Err(StripeContractError::UnsupportedSettlement(_))
         ));
