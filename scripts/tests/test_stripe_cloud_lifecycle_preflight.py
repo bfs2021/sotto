@@ -1,0 +1,242 @@
+import importlib.util
+import io
+import os
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+LOADER = SourceFileLoader(
+    "stripe_cloud_lifecycle_preflight", str(ROOT / "scripts/stripe-cloud-lifecycle-preflight")
+)
+SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[LOADER.name] = MODULE
+LOADER.exec_module(MODULE)
+
+
+def account(account_id="acct_123", livemode=False):
+    return {"id": account_id, "livemode": livemode}
+
+
+def price(price_id, amount, interval, livemode=False):
+    return {
+        "id": price_id,
+        "active": True,
+        "livemode": livemode,
+        "currency": "gbp",
+        "unit_amount": amount,
+        "recurring": {"interval": interval, "interval_count": 1},
+    }
+
+
+def prices():
+    return {
+        "standard_monthly": "price_standard_monthly",
+        "standard_annual": "price_standard_annual",
+        "founding_monthly": "price_founding_monthly",
+        "founding_annual": "price_founding_annual",
+    }
+
+
+def provider_response(path, _api_key):
+    if path == "/v1/account":
+        return account()
+    price_id = path.removeprefix("/v1/prices/")
+    fixtures = {
+        "price_standard_monthly": price(price_id, 299, "month"),
+        "price_standard_annual": price(price_id, 2999, "year"),
+        "price_founding_monthly": price(price_id, 199, "month"),
+        "price_founding_annual": price(price_id, 1999, "year"),
+    }
+    return fixtures[price_id]
+
+
+class SandboxPreflight(unittest.TestCase):
+    def test_price_expectations_match_the_server_catalogue(self):
+        source = (ROOT / "crates/server/src/billing_catalogue.rs").read_text()
+        constants = {
+            name: int(value.replace("_", ""))
+            for name, value in re.findall(
+                r"pub const (STANDARD_MONTHLY_PENCE|STANDARD_ANNUAL_PENCE|"
+                r"FOUNDING_MONTHLY_PENCE|FOUNDING_ANNUAL_PENCE): i64 = ([0-9_]+);",
+                source,
+            )
+        }
+        expected = {
+            "standard_monthly": constants["STANDARD_MONTHLY_PENCE"],
+            "standard_annual": constants["STANDARD_ANNUAL_PENCE"],
+            "founding_monthly": constants["FOUNDING_MONTHLY_PENCE"],
+            "founding_annual": constants["FOUNDING_ANNUAL_PENCE"],
+        }
+        self.assertEqual({name: details[1] for name, details in MODULE.OFFERS.items()}, expected)
+
+    def test_matching_test_account_and_catalogue_produce_only_fingerprints(self):
+        report = MODULE.run_preflight(
+            "acct_123", prices(), "rk_test_never_print_this", provider_response
+        )
+
+        self.assertTrue(report["preflight_passed"])
+        self.assertFalse(report["scenarios_executed"])
+        self.assertFalse(report["write_permissions_verified"])
+        self.assertEqual(report["api_version"], MODULE.server_api_version())
+        self.assertEqual(report["sandbox_account_fingerprint"], MODULE.fingerprint("acct_123"))
+        self.assertEqual(len(report["prices"]), 4)
+        encoded = str(report)
+        self.assertNotIn("acct_123", encoded)
+        self.assertNotIn("price_standard_monthly", encoded)
+        self.assertNotIn("rk_test_never_print_this", encoded)
+
+    def test_live_mode_account_is_rejected_before_price_reads(self):
+        calls = []
+
+        def response(path, key):
+            calls.append(path)
+            return account(livemode=True)
+
+        with self.assertRaisesRegex(MODULE.PreflightError, "sandbox_account_is_live"):
+            MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
+        self.assertEqual(calls, ["/v1/account"])
+
+    def test_wrong_account_is_rejected_without_exposing_ids(self):
+        with self.assertRaises(MODULE.PreflightError) as error:
+            MODULE.run_preflight(
+                "acct_123", prices(), "rk_test_secret",
+                lambda _path, _key: account("acct_456"),
+            )
+        self.assertEqual(str(error.exception), "sandbox_account_identity_mismatch")
+        self.assertNotIn("acct_", str(error.exception))
+
+    def test_catalogue_drift_is_rejected(self):
+        def response(path, key):
+            result = provider_response(path, key)
+            if path == "/v1/prices/price_founding_annual":
+                result["unit_amount"] = 1
+            return result
+
+        with self.assertRaisesRegex(
+            MODULE.PreflightError, "price_catalogue_mismatch:founding_annual"
+        ):
+            MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
+
+    def test_duplicate_price_ids_are_rejected_before_provider_reads(self):
+        configured = prices()
+        configured["founding_monthly"] = configured["standard_monthly"]
+        calls = []
+        with self.assertRaisesRegex(
+            MODULE.PreflightError, "configured_price_ids_must_be_unique"
+        ):
+            MODULE.run_preflight(
+                "acct_123", configured, "rk_test_secret", lambda *args: calls.append(args)
+            )
+        self.assertEqual(calls, [])
+
+    def test_non_test_key_is_rejected_before_provider_reads(self):
+        calls = []
+        with self.assertRaisesRegex(MODULE.PreflightError, "restricted_test_key_required"):
+            MODULE.run_preflight(
+                "acct_123", prices(), "sk_live_secret", lambda *args: calls.append(args)
+            )
+        self.assertEqual(calls, [])
+
+    def test_provider_reads_use_the_fixed_host_and_server_api_version(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b'{"id":"acct_123","livemode":false}'
+
+        with mock.patch.object(MODULE, "urlopen", return_value=Response()) as opener:
+            MODULE.stripe_json("/v1/account", "rk_test_secret")
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.stripe.com/v1/account")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("Stripe-version"), MODULE.server_api_version())
+        self.assertEqual(request.get_header("Authorization"), "Bearer rk_test_secret")
+
+    def test_http_error_diagnostic_does_not_include_provider_response(self):
+        error = MODULE.HTTPError(
+            "https://api.stripe.com/v1/account", 403, "restricted", {}, None
+        )
+        with mock.patch.object(MODULE, "urlopen", side_effect=error):
+            with self.assertRaises(MODULE.PreflightError) as raised:
+                MODULE.stripe_json("/v1/account", "rk_test_secret")
+        self.assertEqual(str(raised.exception), "stripe_read_rejected")
+        self.assertNotIn("rk_test_secret", str(raised.exception))
+
+    def test_key_file_must_be_private_owned_and_not_a_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            parent.chmod(0o700)
+            key_file = parent / "key"
+            key_file.write_text("rk_test_private\n")
+            key_file.chmod(0o600)
+            self.assertEqual(MODULE.read_restricted_key(key_file), "rk_test_private")
+            self.assertEqual(stat.S_IMODE(key_file.stat().st_mode), 0o600)
+
+            key_file.chmod(0o644)
+            with self.assertRaisesRegex(MODULE.PreflightError, "key_file_permissions_invalid"):
+                MODULE.read_restricted_key(key_file)
+
+            key_file.chmod(0o600)
+            link = parent / "key-link"
+            link.symlink_to(key_file)
+            with self.assertRaisesRegex(MODULE.PreflightError, "key_file_path_invalid"):
+                MODULE.read_restricted_key(link)
+
+    def test_private_report_refuses_repository_paths_and_writes_owner_only(self):
+        report = {"preflight_passed": True}
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "private"
+            parent.mkdir(mode=0o700)
+            destination = parent / "preflight.json"
+            MODULE.write_private_report(destination, report)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+            self.assertEqual(MODULE.json.loads(destination.read_text()), report)
+
+        with self.assertRaisesRegex(MODULE.PreflightError, "report_must_be_outside_repository"):
+            MODULE.write_private_report(ROOT / "preflight.json", report)
+
+    def test_cli_writes_a_private_fingerprinted_report_without_printing_the_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            parent.chmod(0o700)
+            key_file = parent / "test-key"
+            key_file.write_text("rk_test_cli_secret\n")
+            key_file.chmod(0o600)
+            output = parent / "report.json"
+            env = {
+                "STRIPE_CLOUD_LIFECYCLE_KEY_FILE": str(key_file),
+                "STRIPE_CLOUD_LIFECYCLE_ACCOUNT_ID": "acct_123",
+                "STRIPE_STANDARD_MONTHLY_PRICE_ID": "price_standard_monthly",
+                "STRIPE_STANDARD_ANNUAL_PRICE_ID": "price_standard_annual",
+                "STRIPE_FOUNDING_MONTHLY_PRICE_ID": "price_founding_monthly",
+                "STRIPE_FOUNDING_ANNUAL_PRICE_ID": "price_founding_annual",
+                "SOTTO_CANDIDATE_SHA": "a" * 40,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch.object(MODULE, "stripe_json", side_effect=provider_response):
+                    captured = io.StringIO()
+                    with redirect_stdout(captured):
+                        self.assertEqual(MODULE.main(["--output", str(output)]), 0)
+
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            report = MODULE.json.loads(output.read_text())
+            self.assertEqual(report["app_sha"], "a" * 40)
+            self.assertTrue(report["preflight_passed"])
+            self.assertNotIn("rk_test_cli_secret", captured.getvalue())
+            self.assertNotIn("rk_test_cli_secret", output.read_text())
+
+
+if __name__ == "__main__":
+    unittest.main()
