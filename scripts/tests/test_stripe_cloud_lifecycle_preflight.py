@@ -8,7 +8,7 @@ import stat
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -118,29 +118,46 @@ class SandboxPreflight(unittest.TestCase):
         self.assertEqual(str(error.exception), "sandbox_account_identity_mismatch")
         self.assertNotIn("acct_", str(error.exception))
 
-    def test_catalogue_drift_is_rejected(self):
-        def response(path, key):
-            result = provider_response(path, key)
-            if path == "/v1/prices/price_founding_annual":
-                result["unit_amount"] = 1
-            return result
+    def test_price_response_rejects_each_server_incompatible_field(self):
+        cases = [
+            ("id", lambda value: value.update(id="price_other")),
+            ("active", lambda value: value.update(active=False)),
+            ("livemode", lambda value: value.update(livemode=True)),
+            ("currency", lambda value: value.update(currency="usd")),
+            ("amount", lambda value: value.update(unit_amount=1)),
+            ("fractional amount", lambda value: value.update(unit_amount=299.0)),
+            ("interval", lambda value: value["recurring"].update(interval="year")),
+            ("interval count", lambda value: value["recurring"].update(interval_count=2)),
+            (
+                "fractional interval count",
+                lambda value: value["recurring"].update(interval_count=1.0),
+            ),
+            (
+                "boolean interval count",
+                lambda value: value["recurring"].update(interval_count=True),
+            ),
+            (
+                "metered usage",
+                lambda value: value["recurring"].update(usage_type="metered"),
+            ),
+            (
+                "missing usage type",
+                lambda value: value["recurring"].pop("usage_type"),
+            ),
+        ]
 
-        with self.assertRaisesRegex(
-            MODULE.PreflightError, "price_catalogue_mismatch:founding_annual"
-        ):
-            MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                def response(path, key):
+                    result = provider_response(path, key)
+                    if path == "/v1/prices/price_standard_monthly":
+                        mutate(result)
+                    return result
 
-    def test_metered_prices_are_rejected(self):
-        def response(path, key):
-            result = provider_response(path, key)
-            if path == "/v1/prices/price_standard_monthly":
-                result["recurring"]["usage_type"] = "metered"
-            return result
-
-        with self.assertRaisesRegex(
-            MODULE.PreflightError, "price_catalogue_mismatch:standard_monthly"
-        ):
-            MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
+                with self.assertRaisesRegex(
+                    MODULE.PreflightError, "price_catalogue_mismatch:standard_monthly"
+                ):
+                    MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
 
     def test_duplicate_price_ids_are_rejected_before_provider_reads(self):
         configured = prices()
@@ -153,6 +170,31 @@ class SandboxPreflight(unittest.TestCase):
                 "acct_123", configured, "rk_test_secret", lambda *args: calls.append(args)
             )
         self.assertEqual(calls, [])
+
+    def test_invalid_preflight_inputs_are_rejected_before_provider_reads(self):
+        invalid_inputs = [
+            ("account id", "not-an-account", prices(), "a" * 40),
+            ("price set", "acct_123", {"standard_monthly": "price_one"}, "a" * 40),
+            (
+                "price id",
+                "acct_123",
+                {**prices(), "standard_monthly": "not-a-price"},
+                "a" * 40,
+            ),
+            ("candidate sha", "acct_123", prices(), "not-a-full-sha"),
+        ]
+        for name, account_id, configured, app_sha in invalid_inputs:
+            with self.subTest(name=name):
+                calls = []
+                with self.assertRaises(MODULE.PreflightError):
+                    MODULE.run_preflight(
+                        account_id,
+                        configured,
+                        "rk_test_secret",
+                        lambda *args: calls.append(args),
+                        app_sha=app_sha,
+                    )
+                self.assertEqual(calls, [])
 
     def test_non_test_key_is_rejected_before_provider_reads(self):
         calls = []
@@ -204,6 +246,47 @@ class SandboxPreflight(unittest.TestCase):
         self.assertEqual(str(raised.exception), "stripe_read_rejected")
         self.assertNotIn("rk_test_secret", str(raised.exception))
 
+    def test_network_failure_diagnostic_does_not_include_provider_details(self):
+        with mock.patch.object(MODULE, "build_opener") as build_opener:
+            build_opener.return_value.open.side_effect = MODULE.URLError(
+                "rk_test_secret must not escape"
+            )
+            with self.assertRaises(MODULE.PreflightError) as raised:
+                MODULE.stripe_json("/v1/account", "rk_test_secret")
+        self.assertEqual(str(raised.exception), "stripe_read_unavailable")
+        self.assertNotIn("rk_test_secret", str(raised.exception))
+
+    def test_invalid_and_oversized_provider_bodies_fail_closed(self):
+        class Response:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, limit):
+                return self.raw[:limit]
+
+        invalid_bodies = [
+            ("malformed json", b"not-json", "stripe_response_invalid"),
+            ("invalid UTF-8", b"\xff", "stripe_response_invalid"),
+            ("non-object JSON", b"[]", "stripe_response_invalid"),
+            (
+                "oversized body",
+                b" " * (MODULE.MAX_RESPONSE_BYTES + 1),
+                "stripe_response_too_large",
+            ),
+        ]
+        for name, raw, error_code in invalid_bodies:
+            with self.subTest(name=name):
+                with mock.patch.object(MODULE, "build_opener") as build_opener:
+                    build_opener.return_value.open.return_value = Response(raw)
+                    with self.assertRaisesRegex(MODULE.PreflightError, error_code):
+                        MODULE.stripe_json("/v1/account", "rk_test_secret")
+
     def test_key_file_must_be_private_owned_and_not_a_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -224,6 +307,12 @@ class SandboxPreflight(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.PreflightError, "key_file_path_invalid"):
                 MODULE.read_restricted_key(link)
 
+            parent.chmod(0o755)
+            with self.assertRaisesRegex(
+                MODULE.PreflightError, "key_file_permissions_invalid"
+            ):
+                MODULE.read_restricted_key(key_file)
+
     def test_private_report_refuses_repository_paths_and_writes_owner_only(self):
         report = {"preflight_passed": True}
         with tempfile.TemporaryDirectory() as directory:
@@ -233,9 +322,26 @@ class SandboxPreflight(unittest.TestCase):
             MODULE.write_private_report(destination, report)
             self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
             self.assertEqual(MODULE.json.loads(destination.read_text()), report)
+            link = parent / "report-link"
+            link.symlink_to(destination)
+            with self.assertRaisesRegex(MODULE.PreflightError, "report_path_invalid"):
+                MODULE.write_private_report(link, report)
 
         with self.assertRaisesRegex(MODULE.PreflightError, "report_must_be_outside_repository"):
             MODULE.write_private_report(ROOT / "preflight.json", report)
+
+    def test_private_report_rejects_relative_paths_and_permissive_directories(self):
+        report = {"preflight_passed": True}
+        with self.assertRaisesRegex(MODULE.PreflightError, "report_path_invalid"):
+            MODULE.write_private_report("relative-report.json", report)
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            parent.chmod(0o755)
+            with self.assertRaisesRegex(
+                MODULE.PreflightError, "report_directory_permissions_invalid"
+            ):
+                MODULE.write_private_report(parent / "preflight.json", report)
 
     def test_cli_writes_a_private_fingerprinted_report_without_printing_the_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -266,6 +372,15 @@ class SandboxPreflight(unittest.TestCase):
             self.assertTrue(report["preflight_passed"])
             self.assertNotIn("rk_test_cli_secret", captured.getvalue())
             self.assertNotIn("rk_test_cli_secret", output.read_text())
+
+    def test_cli_stops_before_provider_reads_when_configuration_is_missing(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(MODULE, "stripe_json") as stripe_json:
+                captured = io.StringIO()
+                with redirect_stderr(captured):
+                    self.assertEqual(MODULE.main(["--output", "/tmp/private/preflight.json"]), 1)
+        self.assertIn("required_configuration_missing:STRIPE_CLOUD_LIFECYCLE_KEY_FILE", captured.getvalue())
+        stripe_json.assert_not_called()
 
 
 if __name__ == "__main__":

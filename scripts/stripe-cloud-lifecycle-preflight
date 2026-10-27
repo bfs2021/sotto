@@ -150,15 +150,19 @@ def run_preflight(
         price_id = configured_prices[offer]
         observed = request_json(f"/v1/prices/{quote(price_id, safe='')}", api_key)
         recurring = observed.get("recurring")
+        unit_amount = observed.get("unit_amount")
+        interval_count = recurring.get("interval_count") if isinstance(recurring, dict) else None
         if (
             observed.get("id") != price_id
             or observed.get("active") is not True
             or observed.get("livemode") is not False
             or observed.get("currency") != "gbp"
-            or observed.get("unit_amount") != expected_amount
+            or type(unit_amount) is not int
+            or unit_amount != expected_amount
             or not isinstance(recurring, dict)
             or recurring.get("interval") != expected_interval
-            or recurring.get("interval_count") != 1
+            or type(interval_count) is not int
+            or interval_count != 1
             or recurring.get("usage_type") != "licensed"
         ):
             raise PreflightError(f"price_catalogue_mismatch:{offer}")
