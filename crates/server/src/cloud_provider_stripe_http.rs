@@ -1632,18 +1632,52 @@ impl StripeReadClient {
             }
             None => return Err(StripeReadError::MalformedResponse("invoice.status")),
         }
-        if invoice.billing_reason.as_deref() != Some("subscription_cycle")
-            || invoice.collection_method.as_deref() != Some("charge_automatically")
-            || invoice
-                .currency
-                .as_deref()
-                .is_none_or(|currency| !currency.eq_ignore_ascii_case(STRIPE_CURRENCY))
-            || invoice.amount_due.is_none_or(|amount| amount <= 0)
-            || invoice.amount_remaining != invoice.amount_due
-            || invoice.amount_paid != Some(0)
-            || invoice.amount_overpaid != Some(0)
-            || invoice.amount_paid_off_stripe != Some(0)
-            || invoice.starting_balance != Some(0)
+        match validate_current_invoice_cycle(&invoice) {
+            Ok(()) => {}
+            Err(CurrentInvoiceCycleError::Malformed(field)) => {
+                return Err(StripeReadError::MalformedResponse(field));
+            }
+            Err(CurrentInvoiceCycleError::Unsupported { .. }) => return Ok(false),
+        }
+        let Some(currency) = invoice.currency.as_deref() else {
+            return Err(StripeReadError::MalformedResponse("invoice.currency"));
+        };
+        let amount_due = invoice
+            .amount_due
+            .ok_or(StripeReadError::MalformedResponse("invoice.amount_due"))?;
+        let amount_remaining =
+            invoice
+                .amount_remaining
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.amount_remaining",
+                ))?;
+        let amount_paid = invoice
+            .amount_paid
+            .ok_or(StripeReadError::MalformedResponse("invoice.amount_paid"))?;
+        let amount_overpaid = invoice
+            .amount_overpaid
+            .ok_or(StripeReadError::MalformedResponse(
+                "invoice.amount_overpaid",
+            ))?;
+        let amount_paid_off_stripe =
+            invoice
+                .amount_paid_off_stripe
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.amount_paid_off_stripe",
+                ))?;
+        let starting_balance =
+            invoice
+                .starting_balance
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.starting_balance",
+                ))?;
+        if !currency.eq_ignore_ascii_case(STRIPE_CURRENCY)
+            || amount_due <= 0
+            || amount_remaining != amount_due
+            || amount_paid != 0
+            || amount_overpaid != 0
+            || amount_paid_off_stripe != 0
+            || starting_balance != 0
         {
             return Ok(false);
         }

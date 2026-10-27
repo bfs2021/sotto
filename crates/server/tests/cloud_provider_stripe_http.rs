@@ -647,19 +647,51 @@ async fn paid_personal_invoice_requests_expanded_off_stripe_amount() {
 
 #[tokio::test]
 async fn renewal_failure_requires_expanded_open_invoice_evidence() {
-    for (mut invoice, expected) in [
-        (open_renewal_invoice(), true),
-        ({
-            let mut invoice = open_renewal_invoice();
-            invoice["amount_paid_off_stripe"] = json!(1);
-            (invoice, false)
-        }),
-    ] {
+    let mut off_stripe_paid = open_renewal_invoice();
+    off_stripe_paid["amount_paid_off_stripe"] = json!(1);
+
+    let mut missing_expanded_amount = open_renewal_invoice();
+    missing_expanded_amount
+        .as_object_mut()
+        .unwrap()
+        .remove("amount_paid_off_stripe");
+
+    let mut missing_amount_due = open_renewal_invoice();
+    missing_amount_due
+        .as_object_mut()
+        .unwrap()
+        .remove("amount_due");
+
+    let missing_required_amounts = [
+        ("amount_remaining", "invoice.amount_remaining"),
+        ("amount_paid", "invoice.amount_paid"),
+        ("amount_overpaid", "invoice.amount_overpaid"),
+        ("starting_balance", "invoice.starting_balance"),
+    ]
+    .into_iter()
+    .map(|(key, field)| {
+        let mut invoice = open_renewal_invoice();
+        invoice.as_object_mut().unwrap().remove(key);
+        (invoice, Err(field))
+    });
+
+    for (invoice, expected) in [
+        (open_renewal_invoice(), Ok(true)),
+        (off_stripe_paid, Ok(false)),
+        (
+            missing_expanded_amount,
+            Err("invoice.amount_paid_off_stripe"),
+        ),
+        (missing_amount_due, Err("invoice.amount_due")),
+    ]
+    .into_iter()
+    .chain(missing_required_amounts)
+    {
         let mut responses = HashMap::new();
         responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
         responses.insert(
             "/v1/invoices/in_1".into(),
-            vec![MockResponse::json(invoice.take())],
+            vec![MockResponse::json(invoice)],
         );
         let server = mock_server(responses).await;
         let client =
@@ -667,17 +699,20 @@ async fn renewal_failure_requires_expanded_open_invoice_evidence() {
                 .unwrap();
         let mut session = client.session();
 
-        assert_eq!(
-            client
-                .personal_renewal_failure_invoice_is_open_and_unpaid(
-                    &mut session,
-                    "in_1",
-                    &personal_binding(),
-                )
-                .await
-                .unwrap(),
-            expected
-        );
+        let result = client
+            .personal_renewal_failure_invoice_is_open_and_unpaid(
+                &mut session,
+                "in_1",
+                &personal_binding(),
+            )
+            .await;
+        match expected {
+            Ok(expected) => assert_eq!(result.unwrap(), expected),
+            Err(field) => assert!(matches!(
+                result,
+                Err(StripeReadError::MalformedResponse(actual)) if actual == field
+            )),
+        }
         let calls = server.state.calls.lock().unwrap();
         let detail = calls
             .iter()
