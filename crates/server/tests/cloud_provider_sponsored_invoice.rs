@@ -510,7 +510,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             "subscription":subscription_id, "metadata":{"organization_id":organization_id}
         }},
         "status":"paid", "currency":"gbp", "amount_paid":797, "amount_due":797,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "amount_remaining":0, "amount_overpaid":0,
+        "paid_out_of_band":false, "starting_balance":0,
         "livemode":false,
         "status_transitions":{"paid_at":now + 10},
         "lines":{"data":[
@@ -535,7 +536,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             "metadata":{"sotto_allocation_reference":personal_reference}
         }},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "amount_remaining":0, "amount_overpaid":0,
+        "paid_out_of_band":false, "starting_balance":0,
         "livemode":false, "lines":{"data":[personal_line]}
     });
     let previous_sponsor_invoice_id = format!("in_previous_sponsor_{fixture}");
@@ -556,7 +558,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             "subscription":previous_sponsor_subscription
         }},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "amount_remaining":0, "amount_overpaid":0,
+        "paid_out_of_band":false, "starting_balance":0,
         "livemode":false, "lines":{"data":[previous_sponsor_line]}
     });
     let lines_response = serde_json::json!({

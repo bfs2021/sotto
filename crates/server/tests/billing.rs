@@ -2124,7 +2124,8 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
             }
         }},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "amount_remaining":0, "amount_overpaid":0,
+        "paid_out_of_band":false, "starting_balance":0,
         "livemode":false, "metadata":{"sotto_allocation_reference":allocation_reference},
         "lines":{"data":[{
             "id":"il_coverage_person", "quantity":1, "livemode":false,
@@ -2756,14 +2757,16 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
         "id":format!("in_paid_{fixture}"), "customer":customer_id,
         "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0, "livemode":false,
+        "amount_remaining":0, "amount_overpaid":0,
+        "paid_out_of_band":false, "starting_balance":0, "livemode":false,
         "metadata":{"sotto_allocation_reference":allocation_reference}
     });
     let open_invoice = serde_json::json!({
         "id":invoice_id, "customer":customer_id,
         "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
         "status":"open", "currency":"gbp", "amount_paid":0, "amount_due":299,
-        "amount_remaining":299, "amount_overpaid":0, "amount_paid_off_stripe":0, "livemode":false,
+        "amount_remaining":299, "amount_overpaid":0,
+        "paid_out_of_band":false, "starting_balance":0, "livemode":false,
         "metadata":{"sotto_allocation_reference":allocation_reference}
     });
     let paid_line = serde_json::json!({
@@ -2790,7 +2793,7 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
             "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
             "status":"open", "billing_reason":"subscription_cycle", "collection_method":"charge_automatically",
             "currency":"gbp", "amount_due":299, "amount_remaining":299, "amount_paid":0,
-            "amount_overpaid":0, "amount_paid_off_stripe":0, "livemode":false,
+            "amount_overpaid":0, "paid_out_of_band":false, "starting_balance":0, "livemode":false,
             "metadata":{"sotto_allocation_reference":allocation_reference},
             "lines":{"object":"list", "has_more":false, "data":[failed_line]}
         }}
