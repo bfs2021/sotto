@@ -532,6 +532,18 @@ class StripeLifecycleRun(unittest.TestCase):
                     idempotency_key="sotto-lifecycle:run:customer",
                 )
 
+    def test_stripe_client_keeps_gateway_timeouts_uncertain(self):
+        client = MODULE.StripeClient("rk_test_not-a-real-key", "acct_123")
+        timeout = MODULE.HTTPError(
+            "https://api.stripe.com/v1/customers", 408, "request timeout", {}, io.BytesIO(b"private"),
+        )
+        with mock.patch.object(client._opener, "open", side_effect=timeout):
+            with self.assertRaisesRegex(MODULE.RunError, "stripe_request_uncertain"):
+                client.request(
+                    "POST", "/v1/customers", {"name": "test"},
+                    idempotency_key="sotto-lifecycle:run:customer",
+                )
+
     def test_cleanup_resumes_through_http_client_after_lost_customer_delete_response(self):
         value = manifest()
         value["status"] = "prepared"

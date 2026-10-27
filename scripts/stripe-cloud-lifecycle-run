@@ -305,7 +305,9 @@ class StripeClient:
             with self._opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except HTTPError as error:
-            uncertain = error.code >= 500 or error.code == 409
+            # A gateway timeout can arrive after Stripe accepted the write. Keep
+            # the operation recoverable with its original idempotency key.
+            uncertain = error.code >= 500 or error.code in {408, 409}
             not_found = error.code == 404
             error.close()
             if uncertain:
