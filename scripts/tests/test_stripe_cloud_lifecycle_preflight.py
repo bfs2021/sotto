@@ -21,8 +21,8 @@ sys.modules[LOADER.name] = MODULE
 LOADER.exec_module(MODULE)
 
 
-def account(account_id="acct_123", livemode=False):
-    return {"id": account_id, "livemode": livemode}
+def account(account_id="acct_123"):
+    return {"id": account_id, "object": "account"}
 
 
 def price(price_id, amount, interval, livemode=False):
@@ -93,16 +93,17 @@ class SandboxPreflight(unittest.TestCase):
         self.assertNotIn("price_standard_monthly", encoded)
         self.assertNotIn("rk_test_never_print_this", encoded)
 
-    def test_live_mode_account_is_rejected_before_price_reads(self):
+    def test_account_without_livemode_field_is_accepted(self):
         calls = []
 
         def response(path, key):
             calls.append(path)
-            return account(livemode=True)
+            return provider_response(path, key)
 
-        with self.assertRaisesRegex(MODULE.PreflightError, "sandbox_account_is_live"):
-            MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
-        self.assertEqual(calls, ["/v1/account"])
+        report = MODULE.run_preflight("acct_123", prices(), "rk_test_secret", response)
+        self.assertTrue(report["preflight_passed"])
+        self.assertEqual(calls[0], "/v1/account")
+        self.assertEqual(len(calls), 5)
 
     def test_wrong_account_is_rejected_without_exposing_ids(self):
         with self.assertRaises(MODULE.PreflightError) as error:
@@ -156,19 +157,32 @@ class SandboxPreflight(unittest.TestCase):
             def read(self, _limit):
                 return b'{"id":"acct_123","livemode":false}'
 
-        with mock.patch.object(MODULE, "urlopen", return_value=Response()) as opener:
+        with mock.patch.object(MODULE, "build_opener") as build_opener:
+            build_opener.return_value.open.return_value = Response()
             MODULE.stripe_json("/v1/account", "rk_test_secret")
-        request = opener.call_args.args[0]
+        self.assertIsInstance(build_opener.call_args.args[0], MODULE.RejectStripeRedirects)
+        request = build_opener.return_value.open.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.stripe.com/v1/account")
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(request.get_header("Stripe-version"), MODULE.server_api_version())
         self.assertEqual(request.get_header("Authorization"), "Bearer rk_test_secret")
 
+    def test_redirect_handler_rejects_other_hosts(self):
+        request = MODULE.Request("https://api.stripe.com/v1/account")
+        with self.assertRaises(MODULE.HTTPError) as raised:
+            MODULE.RejectStripeRedirects().redirect_request(
+                request, None, 302, "Found", {}, "https://attacker.example/v1/account"
+            )
+        self.assertEqual(raised.exception.code, 302)
+        self.assertEqual(raised.exception.url, "https://api.stripe.com/v1/account")
+        raised.exception.close()
+
     def test_http_error_diagnostic_does_not_include_provider_response(self):
         error = MODULE.HTTPError(
             "https://api.stripe.com/v1/account", 403, "restricted", {}, None
         )
-        with mock.patch.object(MODULE, "urlopen", side_effect=error):
+        with mock.patch.object(MODULE, "build_opener") as build_opener:
+            build_opener.return_value.open.side_effect = error
             with self.assertRaises(MODULE.PreflightError) as raised:
                 MODULE.stripe_json("/v1/account", "rk_test_secret")
         self.assertEqual(str(raised.exception), "stripe_read_rejected")
