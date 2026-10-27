@@ -577,13 +577,13 @@ pub fn decode_personal_renewal_failure(
     let amount_remaining = required_i64(invoice, "amount_remaining")?;
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;
-    let amount_paid_off_stripe = required_i64(invoice, "amount_paid_off_stripe")?;
+    let paid_out_of_band = required_bool(invoice, "paid_out_of_band")?;
+    let starting_balance = required_i64(invoice, "starting_balance")?;
     for (amount, field) in [
         (amount_due, "amount_due"),
         (amount_remaining, "amount_remaining"),
         (amount_paid, "amount_paid"),
         (amount_overpaid, "amount_overpaid"),
-        (amount_paid_off_stripe, "amount_paid_off_stripe"),
     ] {
         if amount < 0 {
             return Err(StripeContractError::InvalidField(field));
@@ -595,7 +595,7 @@ pub fn decode_personal_renewal_failure(
     if amount_remaining == 0 {
         return Err(StripeContractError::InvalidField("amount_remaining"));
     }
-    if amount_paid != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
+    if amount_paid != 0 || amount_overpaid != 0 || paid_out_of_band || starting_balance != 0 {
         return Err(StripeContractError::UnsupportedSettlement(
             "renewal invoice has a partial or off-Stripe settlement",
         ));

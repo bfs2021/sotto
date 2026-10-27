@@ -321,7 +321,8 @@ fn paid_invoice() -> Value {
         "amount_due":299,
         "amount_remaining":0,
         "amount_overpaid":0,
-        "amount_paid_off_stripe":0,
+        "paid_out_of_band":false,
+        "starting_balance":0,
         "livemode":false,
     })
 }
@@ -576,6 +577,43 @@ async fn assembles_a_personal_invoice_observation_from_complete_reads() {
         observation.evidence_reference(),
         "stripe:invoice:in_1:line:il_1"
     );
+}
+
+#[tokio::test]
+async fn accepts_paid_personal_invoice_without_nonexistent_off_stripe_amount_field() {
+    let mut invoice = paid_invoice();
+    invoice["paid_out_of_band"] = json!(false);
+    invoice
+        .as_object_mut()
+        .expect("invoice fixture is an object")
+        .remove("amount_paid_off_stripe");
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(invoice)],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![paid_payment()], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let observation = client
+        .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+        .await
+        .expect("a complete PaymentIntent settlement is sufficient evidence");
+
+    assert_eq!(observation.invoice_id(), "in_1");
+    assert_eq!(observation.payment_intent_id(), "pi_1");
 }
 
 #[tokio::test]
@@ -1203,6 +1241,32 @@ async fn rejects_amount_period_and_settlement_contract_violations() {
         ))
     ));
 
+    for (field, value) in [
+        ("paid_out_of_band", json!(true)),
+        ("starting_balance", json!(1)),
+    ] {
+        let mut invoice = paid_invoice();
+        invoice[field] = value;
+        let server = mock_server(observation_responses(
+            invoice,
+            personal_line("il_1"),
+            paid_payment(),
+        ))
+        .await;
+        let client =
+            StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits())
+                .unwrap();
+        let mut session = client.session();
+        assert!(matches!(
+            client
+                .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+                .await,
+            Err(StripeReadError::Observation(
+                sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+            ))
+        ));
+    }
+
     let mut line = personal_line("il_1");
     line["period"]["end"] = json!(1700000000);
     let server = mock_server(observation_responses(paid_invoice(), line, paid_payment())).await;
@@ -1683,13 +1747,10 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
         .any(|call| call.path_and_query.contains("starting_after=in_2")));
     let invoice_detail_calls: Vec<_> = calls
         .iter()
-        .filter(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
+        .filter(|call| call.path_and_query == "/v1/invoices/in_1")
         .collect();
     assert_eq!(invoice_detail_calls.len(), 1);
-    assert_eq!(
-        query_pairs(invoice_detail_calls[0]),
-        vec![("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())]
-    );
+    assert!(query_pairs(invoice_detail_calls[0]).is_empty());
 }
 
 #[tokio::test]
@@ -2004,7 +2065,7 @@ async fn invoice_history_detects_a_paid_header_change_during_assembly() {
     );
     let listed = paid_invoice();
     let mut detailed = paid_invoice();
-    detailed["amount_paid_off_stripe"] = json!(1);
+    detailed["paid_out_of_band"] = json!(true);
     responses.insert(
         "/v1/invoices".into(),
         vec![MockResponse::json(list(vec![listed], false))],

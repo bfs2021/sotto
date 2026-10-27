@@ -414,12 +414,7 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}");
-        // Stripe marks amount_paid_off_stripe as includable rather than returning it by
-        // default. We require it to distinguish Stripe settlements from off-Stripe payment.
-        let query = [("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())];
-        let value = self
-            .request_json(session, Method::GET, &path, &query)
-            .await?;
+        let value = self.request_json(session, Method::GET, &path, &[]).await?;
         let resource = parse_invoice(&value)?;
         if resource.id != invoice_id {
             return Err(StripeReadError::ContextMismatch);
@@ -804,17 +799,30 @@ impl StripeReadClient {
             .ok_or(StripeReadError::MalformedResponse(
                 "invoice.amount_overpaid",
             ))?;
-        let amount_paid_off_stripe =
+        let paid_out_of_band =
             invoice
-                .amount_paid_off_stripe
+                .paid_out_of_band
                 .ok_or(StripeReadError::MalformedResponse(
-                    "invoice.amount_paid_off_stripe",
+                    "invoice.paid_out_of_band",
+                ))?;
+        let starting_balance =
+            invoice
+                .starting_balance
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.starting_balance",
                 ))?;
         let currency = invoice
             .currency
             .clone()
             .ok_or(StripeReadError::MalformedResponse("invoice.currency"))?;
-        if amount_remaining != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
+        if amount_remaining != 0
+            || amount_overpaid != 0
+            || invoice
+                .amount_paid_off_stripe
+                .is_some_and(|amount| amount != 0)
+            || paid_out_of_band
+            || starting_balance != 0
+        {
             return Err(StripeReadError::Observation(
                 StripeContractError::UnsupportedSettlement(
                     "sponsored invoice has unresolved financial amounts",
@@ -1062,6 +1070,18 @@ impl StripeReadClient {
             ));
         }
         let settlement = payments[0].settlement(&self.coverage)?;
+        let paid_out_of_band =
+            invoice
+                .paid_out_of_band
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.paid_out_of_band",
+                ))?;
+        let starting_balance =
+            invoice
+                .starting_balance
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.starting_balance",
+                ))?;
         validate_personal_invoice_observation(
             &self.coverage,
             binding,
@@ -1103,9 +1123,9 @@ impl StripeReadClient {
                 amount_overpaid: invoice.amount_overpaid.ok_or(
                     StripeReadError::MalformedResponse("invoice.amount_overpaid"),
                 )?,
-                amount_paid_off_stripe: invoice.amount_paid_off_stripe.ok_or(
-                    StripeReadError::MalformedResponse("invoice.amount_paid_off_stripe"),
-                )?,
+                amount_paid_off_stripe: invoice.amount_paid_off_stripe.unwrap_or(0),
+                paid_out_of_band,
+                starting_balance,
                 period_start: line
                     .period_start
                     .ok_or(StripeReadError::MalformedResponse("line.period.start"))?,
@@ -1976,6 +1996,8 @@ pub struct StripeInvoiceResource {
     pub amount_remaining: Option<i64>,
     pub amount_overpaid: Option<i64>,
     pub amount_paid_off_stripe: Option<i64>,
+    pub paid_out_of_band: Option<bool>,
+    pub starting_balance: Option<i64>,
     pub allocation_reference: Option<String>,
     pub livemode: Option<bool>,
     /// Line summaries included in the Invoice response. When `lines_complete` is false, callers
@@ -2236,6 +2258,8 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
         // summary value is unknown rather than evidence that the invoice changed.
         && (left.amount_paid_off_stripe.is_none()
             || left.amount_paid_off_stripe == right.amount_paid_off_stripe)
+        && left.paid_out_of_band == right.paid_out_of_band
+        && left.starting_balance == right.starting_balance
         && left.allocation_reference == right.allocation_reference
         && left.livemode == right.livemode
 }
@@ -2386,7 +2410,12 @@ fn validate_current_line(
 fn open_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
     matches!(
         (invoice.amount_due, invoice.amount_remaining, invoice.amount_paid, invoice.amount_overpaid, invoice.amount_paid_off_stripe),
-        (Some(due), Some(remaining), Some(0), Some(0), Some(0)) if due > 0 && remaining == due
+        (Some(due), Some(remaining), Some(0), Some(0), amount_paid_off_stripe)
+            if due > 0
+                && remaining == due
+                && amount_paid_off_stripe.is_none_or(|amount| amount == 0)
+                && invoice.paid_out_of_band == Some(false)
+                && invoice.starting_balance == Some(0)
     )
 }
 
@@ -2399,8 +2428,13 @@ fn closed_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
             invoice.amount_overpaid,
             invoice.amount_paid_off_stripe
         ),
-        (Some(due), Some(remaining), Some(0), Some(0), Some(0))
-            if due >= 0 && remaining >= 0 && remaining <= due
+        (Some(due), Some(remaining), Some(0), Some(0), amount_paid_off_stripe)
+            if due >= 0
+                && remaining >= 0
+                && remaining <= due
+                && amount_paid_off_stripe.is_none_or(|amount| amount == 0)
+                && invoice.paid_out_of_band == Some(false)
+                && invoice.starting_balance == Some(0)
     )
 }
 
@@ -2957,6 +2991,8 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             value.get("amount_paid_off_stripe"),
             "invoice.amount_paid_off_stripe",
         )?,
+        paid_out_of_band: optional_bool(value.get("paid_out_of_band"), "invoice.paid_out_of_band")?,
+        starting_balance: optional_i64(value.get("starting_balance"), "invoice.starting_balance")?,
         allocation_reference: parent_allocation_reference.or(invoice_allocation_reference),
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
         line_summaries,
